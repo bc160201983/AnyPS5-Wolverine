@@ -72,6 +72,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
 | `APS5_TRACE_LABEL` | integer | `core/libs/prx/libSceAgc/Cb/src/Sync.cpp`, `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/LabelHistory.cpp` | 0 | hex guest address; logs a matching RELEASE_MEM when recorded, and nearby RELEASE_MEM, WRITE_DATA, COPY_DATA, DMA_DATA and WAIT_REG_MEM packets when executed |
+| `APS5_TRACE_MARKERS` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Packets/PacketExecution.cpp` |  | `<start seconds>:<frames>`; from that many seconds after the first packet, prints for each of the next frames the title's PUSH_MARKER paths per queue with their draw and dispatch counts |
 
 ### libSceAgcDriver
 

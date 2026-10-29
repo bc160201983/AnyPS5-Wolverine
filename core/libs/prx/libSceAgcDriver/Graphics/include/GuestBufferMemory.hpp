@@ -295,7 +295,9 @@ private:
     std::atomic<std::uint64_t> largest{0};
 };
 
-void NoteGpuProduced(std::uint64_t begin, std::uint64_t end, std::uint64_t generation);
+void NoteGpuProduced(std::uint64_t begin, std::uint64_t end, std::uint64_t generation, std::shared_ptr<Buffer> shadow = nullptr, std::uint64_t shadowBase = 0);
+std::shared_ptr<Buffer> GpuProducedShadow(std::uint64_t address, std::size_t bytes, VkDeviceSize alignment, VkDeviceSize* offset);
+bool ReadGpuProducedShadows();
 bool GpuProducedUnchanged(std::uint64_t address, std::size_t bytes);
 bool SkipGpuProducedSnapshots();
 

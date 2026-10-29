@@ -6222,9 +6222,16 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 
 namespace {
 
+struct GpuProducedRange {
+    std::uint64_t end = 0;
+    std::uint64_t generation = 0;
+    std::shared_ptr<Buffer> shadow;
+    std::uint64_t shadowBase = 0;
+};
+
 struct GpuProducedRanges {
     AgcDriver::Mutex mutex;
-    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::map<std::uint64_t, GpuProducedRange> ranges;
 };
 
 GpuProducedRanges& gpuProduced() {
@@ -6242,29 +6249,58 @@ bool SkipGpuProducedSnapshots() {
     return enabled;
 }
 
-void NoteGpuProduced(std::uint64_t begin, std::uint64_t end, std::uint64_t generation) {
-    if (!SkipGpuProducedSnapshots() || begin >= end || generation == 0) return;
+bool ReadGpuProducedShadows() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DRAW_READ_SHADOWS");
+        return text != nullptr && text[0] != '0' && text[0] != 0;
+    }();
+    return enabled;
+}
+
+void NoteGpuProduced(std::uint64_t begin, std::uint64_t end, std::uint64_t generation, std::shared_ptr<Buffer> shadow, std::uint64_t shadowBase) {
+    if ((!SkipGpuProducedSnapshots() && !ReadGpuProducedShadows()) || begin >= end || generation == 0) return;
     auto& state = gpuProduced();
     std::lock_guard lock(state.mutex);
     if (state.ranges.size() >= 65536) state.ranges.clear();
     auto& entry = state.ranges[begin];
-    if (entry.first < end || entry.second < generation) entry = {std::max(entry.first, end), std::max(entry.second, generation)};
+    entry.end = end;
+    entry.generation = std::max(entry.generation, generation);
+    entry.shadow = std::move(shadow);
+    entry.shadowBase = shadowBase;
+}
+
+namespace {
+
+std::optional<GpuProducedRange> gpuProducedCovering(std::uint64_t address, std::size_t bytes) {
+    auto& state = gpuProduced();
+    std::lock_guard lock(state.mutex);
+    auto found = state.ranges.upper_bound(address);
+    if (found == state.ranges.begin()) return std::nullopt;
+    --found;
+    if (found->second.end < address + bytes) return std::nullopt;
+    return found->second;
+}
+
 }
 
 bool GpuProducedUnchanged(std::uint64_t address, std::size_t bytes) {
     if (!SkipGpuProducedSnapshots() || bytes == 0) return false;
-    std::uint64_t generation = 0;
-    {
-        auto& state = gpuProduced();
-        std::lock_guard lock(state.mutex);
-        auto found = state.ranges.upper_bound(address);
-        if (found == state.ranges.begin()) return false;
-        --found;
-        if (found->second.first < address + bytes) return false;
-        generation = found->second.second;
-    }
+    const auto entry = gpuProducedCovering(address, bytes);
+    if (!entry.has_value()) return false;
     GuestMemory::CollectWrites(address, bytes);
-    return GuestMemory::UnchangedSince(address, bytes, generation);
+    return GuestMemory::UnchangedSince(address, bytes, entry->generation);
+}
+
+std::shared_ptr<Buffer> GpuProducedShadow(std::uint64_t address, std::size_t bytes, VkDeviceSize alignment, VkDeviceSize* offset) {
+    if (!ReadGpuProducedShadows() || bytes == 0) return nullptr;
+    const auto entry = gpuProducedCovering(address, bytes);
+    if (!entry.has_value() || entry->shadow == nullptr || address < entry->shadowBase) return nullptr;
+    const auto at = static_cast<VkDeviceSize>(address - entry->shadowBase);
+    if (alignment != 0 && at % alignment != 0) return nullptr;
+    GuestMemory::CollectWrites(address, bytes);
+    if (!GuestMemory::UnchangedSince(address, bytes, entry->generation)) return nullptr;
+    *offset = at;
+    return entry->shadow;
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
@@ -6288,7 +6324,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
             const auto generation = GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin));
             if (generation != 0) directWritesGeneration = std::max(directWritesGeneration, generation);
             if (region.residentCandidate && generation != 0) region.residentGeneration = std::max(region.residentGeneration, generation);
-            NoteGpuProduced(begin, end, generation);
+            NoteGpuProduced(begin, end, generation, region.gpuCopy && region.deviceLocal ? region.buffer : nullptr, region.begin);
         }
     }
 }

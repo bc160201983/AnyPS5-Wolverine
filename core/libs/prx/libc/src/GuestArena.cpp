@@ -421,6 +421,110 @@ bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }
 
+namespace {
+
+struct Traps {
+    std::mutex mutex;
+    std::map<std::uintptr_t, DWORD> pages;
+    std::atomic<std::uint64_t> armed{0};
+    std::atomic<std::uint64_t> gameFaults{0};
+    std::atomic<std::uint64_t> otherFaults{0};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::size_t> armedPages{0};
+    std::map<std::uintptr_t, std::uint64_t> sites;
+};
+
+Traps& traps() {
+    static Traps state;
+    return state;
+}
+
+bool inMainImage(std::uintptr_t instruction) {
+    static const std::pair<std::uintptr_t, std::uintptr_t> image = [] {
+        const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + static_cast<std::uintptr_t>(dos->e_lfanew));
+        return std::pair<std::uintptr_t, std::uintptr_t>{base, base + nt->OptionalHeader.SizeOfImage};
+    }();
+    return instruction >= image.first && instruction < image.second;
+}
+
+}
+
+void GuestArenaTrap_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    constexpr std::uintptr_t page = 4096;
+    constexpr std::size_t maxPages = 65536;
+    const auto first = (address + page - 1) & ~(page - 1);
+    const auto last = (address + bytes) & ~(page - 1);
+    if (first >= last) return;
+    auto& state = traps();
+    std::lock_guard lock(state.mutex);
+    for (auto cursor = first; cursor < last; cursor += page) {
+        if (state.pages.contains(cursor)) continue;
+        if (state.pages.size() >= maxPages) {
+            state.skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) {
+            state.skipped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        DWORD previous = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(cursor), page, PAGE_NOACCESS, &previous) == 0) {
+            state.skipped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        state.pages.emplace(cursor, previous);
+        state.armed.fetch_add(1, std::memory_order_relaxed);
+    }
+    state.armedPages.store(state.pages.size(), std::memory_order_relaxed);
+}
+
+bool GuestArenaTrapArmed_nid_postfix(std::uintptr_t address) {
+    auto& state = traps();
+    if (state.armedPages.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard lock(state.mutex);
+    return state.pages.contains(address & ~std::uintptr_t{4095});
+}
+
+bool GuestArenaHandleTrap_nid_postfix(std::uintptr_t address, std::uintptr_t instruction) {
+    auto& state = traps();
+    if (state.armedPages.load(std::memory_order_relaxed) == 0) return false;
+    const auto page = address & ~std::uintptr_t{4095};
+    std::lock_guard lock(state.mutex);
+    const auto found = state.pages.find(page);
+    if (found == state.pages.end()) return false;
+    DWORD previous = 0;
+    if (VirtualProtect(reinterpret_cast<void*>(page), 4096, found->second, &previous) == 0) return false;
+    state.pages.erase(found);
+    state.armedPages.store(state.pages.size(), std::memory_order_relaxed);
+    (inMainImage(instruction) ? state.gameFaults : state.otherFaults).fetch_add(1, std::memory_order_relaxed);
+    ++state.sites[instruction];
+    return true;
+}
+
+std::size_t GuestArenaTrapSites_nid_postfix(std::uintptr_t* instructions, std::uint64_t* counts, std::size_t capacity) {
+    auto& state = traps();
+    std::lock_guard lock(state.mutex);
+    std::vector<std::pair<std::uintptr_t, std::uint64_t>> sorted(state.sites.begin(), state.sites.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+    const auto count = std::min(capacity, sorted.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        instructions[i] = sorted[i].first;
+        counts[i] = sorted[i].second;
+    }
+    return count;
+}
+
+void GuestArenaTrapStats_nid_postfix(std::uint64_t* armed, std::uint64_t* gameFaults, std::uint64_t* otherFaults, std::uint64_t* skipped) {
+    auto& state = traps();
+    *armed = state.armed.load(std::memory_order_relaxed);
+    *gameFaults = state.gameFaults.load(std::memory_order_relaxed);
+    *otherFaults = state.otherFaults.load(std::memory_order_relaxed);
+    *skipped = state.skipped.load(std::memory_order_relaxed);
+}
+
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);

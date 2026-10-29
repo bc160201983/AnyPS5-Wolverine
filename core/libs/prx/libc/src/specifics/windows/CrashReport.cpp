@@ -350,9 +350,31 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+std::uintptr_t TrapCaller(const CONTEXT& faulting) {
+    static const auto runtime = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"ucrtbase.dll"));
+    CONTEXT context = faulting;
+    for (int depth = 0; depth < 6; ++depth) {
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(context.Rip), &module)) break;
+        if (reinterpret_cast<std::uintptr_t>(module) != runtime) return context.Rip;
+        DWORD64 imageBase = 0;
+        const auto entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+        if (entry == nullptr) {
+            context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+            context.Rsp += 8;
+            continue;
+        }
+        void* handlerData = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handlerData, &establisher, nullptr);
+    }
+    return faulting.Rip;
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && GuestArena::GuestArenaTrapArmed_nid_postfix(fault->ExceptionInformation[1]) && GuestArena::GuestArenaHandleTrap_nid_postfix(fault->ExceptionInformation[1], TrapCaller(*info->ContextRecord))) return EXCEPTION_CONTINUE_EXECUTION;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;

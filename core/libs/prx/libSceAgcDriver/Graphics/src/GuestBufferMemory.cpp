@@ -5926,6 +5926,41 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (region.deviceLocal) Copies().stagedOutBytes.fetch_add(to - from, std::memory_order_relaxed);
             }
         }
+#ifdef _WIN32
+        static const bool trap = [] {
+            const char* text = std::getenv("APS5_RESIDENT_TRAP");
+            return text != nullptr && text[0] != '\0' && text[0] != '0';
+        }();
+        if (trap && region.deviceLocal) {
+            for (const auto& [begin, end] : merged) {
+                const auto from = std::max(begin, region.begin);
+                const auto to = std::min(end, region.end);
+                if (from < to) GuestArena::GuestArenaTrap_nid_postfix(from, static_cast<std::size_t>(to - from));
+            }
+            static std::atomic<std::int64_t> lastReport{0};
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto previous = lastReport.load(std::memory_order_relaxed);
+            if (now - previous >= 10 && lastReport.compare_exchange_strong(previous, now)) {
+                std::uint64_t armed = 0, gameFaults = 0, otherFaults = 0, skipped = 0;
+                GuestArena::GuestArenaTrapStats_nid_postfix(&armed, &gameFaults, &otherFaults, &skipped);
+                std::fprintf(stderr, "[resident-trap] cumulative: %llu pages armed, faults from game code %llu, from other code %llu, %llu skipped\n", static_cast<unsigned long long>(armed), static_cast<unsigned long long>(gameFaults), static_cast<unsigned long long>(otherFaults), static_cast<unsigned long long>(skipped));
+                std::array<std::uintptr_t, 12> sites{};
+                std::array<std::uint64_t, 12> siteCounts{};
+                const auto found = GuestArena::GuestArenaTrapSites_nid_postfix(sites.data(), siteCounts.data(), sites.size());
+                std::string text;
+                for (std::size_t i = 0; i < found; ++i) {
+                    HMODULE module = nullptr;
+                    char name[MAX_PATH] = "?";
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(sites[i]), &module)) GetModuleFileNameA(module, name, sizeof(name));
+                    const char* base = std::strrchr(name, '\\');
+                    char item[160];
+                    std::snprintf(item, sizeof(item), " %s+0x%llx x%llu", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(sites[i] - reinterpret_cast<std::uintptr_t>(module)), static_cast<unsigned long long>(siteCounts[i]));
+                    text += item;
+                }
+                std::fprintf(stderr, "[resident-trap] fault sites:%s\n", text.c_str());
+            }
+        }
+#endif
         // Only once its copies are recorded: a throw above leaves the region counted by
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
@@ -6185,6 +6220,53 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
     return false;
 }
 
+namespace {
+
+struct GpuProducedRanges {
+    AgcDriver::Mutex mutex;
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
+GpuProducedRanges& gpuProduced() {
+    static GpuProducedRanges state;
+    return state;
+}
+
+}
+
+bool SkipGpuProducedSnapshots() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DRAW_SKIP_GPU_SNAPSHOTS");
+        return text != nullptr && text[0] != '0' && text[0] != 0;
+    }();
+    return enabled;
+}
+
+void NoteGpuProduced(std::uint64_t begin, std::uint64_t end, std::uint64_t generation) {
+    if (!SkipGpuProducedSnapshots() || begin >= end || generation == 0) return;
+    auto& state = gpuProduced();
+    std::lock_guard lock(state.mutex);
+    if (state.ranges.size() >= 65536) state.ranges.clear();
+    auto& entry = state.ranges[begin];
+    if (entry.first < end || entry.second < generation) entry = {std::max(entry.first, end), std::max(entry.second, generation)};
+}
+
+bool GpuProducedUnchanged(std::uint64_t address, std::size_t bytes) {
+    if (!SkipGpuProducedSnapshots() || bytes == 0) return false;
+    std::uint64_t generation = 0;
+    {
+        auto& state = gpuProduced();
+        std::lock_guard lock(state.mutex);
+        auto found = state.ranges.upper_bound(address);
+        if (found == state.ranges.begin()) return false;
+        --found;
+        if (found->second.first < address + bytes) return false;
+        generation = found->second.second;
+    }
+    GuestMemory::CollectWrites(address, bytes);
+    return GuestMemory::UnchangedSince(address, bytes, generation);
+}
+
 void GuestBufferMemory::MarkDirectWrites() const {
     // APS5_RESIDENT_STAGING: a staged region is kept only when nothing stored over it since its
     // copy-in was recorded; checked before this use's own marks stamp it.
@@ -6206,6 +6288,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
             const auto generation = GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin));
             if (generation != 0) directWritesGeneration = std::max(directWritesGeneration, generation);
             if (region.residentCandidate && generation != 0) region.residentGeneration = std::max(region.residentGeneration, generation);
+            NoteGpuProduced(begin, end, generation);
         }
     }
 }

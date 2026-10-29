@@ -295,6 +295,10 @@ private:
     std::atomic<std::uint64_t> largest{0};
 };
 
+void NoteGpuProduced(std::uint64_t begin, std::uint64_t end, std::uint64_t generation);
+bool GpuProducedUnchanged(std::uint64_t address, std::size_t bytes);
+bool SkipGpuProducedSnapshots();
+
 class GuestBufferMemory {
 public:
     explicit GuestBufferMemory(const Context& context);

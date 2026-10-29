@@ -1450,6 +1450,15 @@ bool sharedCollectMemo() {
     return shared;
 }
 
+bool blockCollect() {
+#ifdef _WIN32
+    static const bool enabled = std::getenv("APS5_WINDOWS_BLOCK_COLLECT") != nullptr;
+    return enabled;
+#else
+    return true;
+#endif
+}
+
 struct StampRuns {
     WriteTracker& tracker;
     StampKind kind;
@@ -1606,8 +1615,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-#ifndef _WIN32
-    if (useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
+    if (blockCollect() && useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
         const auto begin = first & ~(WriteBlockBytes - 1);
         const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
         if (end > begin && tracker.covers(begin, end - begin)) {
@@ -1615,7 +1623,6 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             stop = end;
         }
     }
-#endif
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {

@@ -5062,6 +5062,19 @@ std::uint64_t writtenShadowMax(bool discreteGpu) {
     return discreteGpu ? DiscreteWrittenShadowMax : std::uint64_t{2048} << 10u;
 }
 
+// APS5_RESIDENT_STAGING=1: a staged shadow outlives its use. Its copy-back leaves the import equal to
+// it, so a reused build's next use needs no copy-in while nothing stored over the range since: no CPU
+// store (write watch) and no other GPU writer (they all stamp the range, MarkWritten), checked with
+// the write tracker as snapshots are. The copy-back stays (CPU readers and in-place users read the
+// import). A range anything stored over between the copy-in and the copy-back is not kept.
+bool residentStagingEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_RESIDENT_STAGING");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return enabled;
+}
+
 std::uint64_t atomicStageMax() {
     static const std::uint64_t bytes = kibSetting("APS5_ATOMIC_STAGE_MAX_KIB", 1024);
     return bytes;
@@ -5096,6 +5109,9 @@ struct CopyStats {
     std::atomic<std::uint64_t> stagedOutBytes{0};
     std::atomic<std::uint64_t> stagedLost{0};
     std::atomic<std::uint64_t> stagingRefused{0};
+    // APS5_RESIDENT_STAGING: copy-ins skipped (shadow still current) and their bytes.
+    std::atomic<std::uint64_t> residentKept{0};
+    std::atomic<std::uint64_t> residentKeptBytes{0};
     std::atomic<std::int64_t> lastStagingReport{0};
 };
 
@@ -5136,14 +5152,16 @@ void reportStaging() {
     auto last = stats.lastStagingReport.load();
     if (nowMs - last < 10000 || !stats.lastStagingReport.compare_exchange_strong(last, nowMs)) return;
     // One reporter per period (the exchange above), so the previous totals need no lock.
-    static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0;
+    static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0, lastKept = 0, lastKeptBytes = 0;
     const auto staged = stats.staged.load();
     const auto in = stats.stagedInBytes.load();
     const auto out = stats.stagedOutBytes.load();
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back, %llu copy-ins skipped (resident, %.0f KiB)\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0, static_cast<unsigned long long>(stats.residentKept.load() - lastKept), (stats.residentKeptBytes.load() - lastKeptBytes) / 1024.0);
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
+    lastKept = stats.residentKept.load();
+    lastKeptBytes = stats.residentKeptBytes.load();
 }
 
 }
@@ -5760,6 +5778,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
+        if (region->deviceLocal && residentStagingEnabled()) region->copyInGeneration = GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes));
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
@@ -6167,6 +6186,18 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    // APS5_RESIDENT_STAGING: a staged region is kept only when nothing stored over it since its
+    // copy-in was recorded; checked before this use's own marks stamp it.
+    if (residentStagingEnabled()) {
+        for (const auto& region : regions) {
+            region.residentGeneration = 0;
+            region.residentCandidate = false;
+            if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack || region.atomic || region.copyInGeneration == 0) continue;
+            const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+            GuestMemory::CollectWrites(region.begin, bytes);
+            region.residentCandidate = GuestMemory::UnchangedSince(region.begin, bytes, region.copyInGeneration);
+        }
+    }
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
         if (found == nullptr) continue;
@@ -6174,6 +6205,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) {
             const auto generation = GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin));
             if (generation != 0) directWritesGeneration = std::max(directWritesGeneration, generation);
+            if (region.residentCandidate && generation != 0) region.residentGeneration = std::max(region.residentGeneration, generation);
         }
     }
 }
@@ -6459,7 +6491,24 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
+        const bool resident = residentStagingEnabled() && region.copiedBack && region.residentGeneration != 0 && !region.atomic && region.buffer != nullptr;
         region.copiedBack = false;
+        if (resident) {
+            const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+            GuestMemory::CollectWrites(region.begin, bytes);
+            if (GuestMemory::UnchangedSince(region.begin, bytes, region.residentGeneration) && !(recorder.HasQueuedStores() && recorder.QueuedStoreOverlaps(region.begin, bytes)) && !(recorder.HasQueuedKeyStores() && recorder.QueuedKeyStoreOverlaps(region.begin, bytes)) && !recorder.PendingLabelIn(region.begin, bytes)) {
+                // The shadow is the import's content: this use's dispatch reads and writes it as is,
+                // and the copy-back recorded after the work keeps the import in step.
+                region.copyInGeneration = region.residentGeneration;
+                recorder.Keep(region.buffer);
+                if (profile) {
+                    Copies().residentKept.fetch_add(1, std::memory_order_relaxed);
+                    Copies().residentKeptBytes.fetch_add(bytes, std::memory_order_relaxed);
+                }
+                continue;
+            }
+        }
+        region.residentGeneration = 0;
         copies.push_back(&region);
     }
     if (copies.empty()) return;

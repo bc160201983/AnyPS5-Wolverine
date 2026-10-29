@@ -15,10 +15,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace AgcDriver::DriverDetail {
@@ -171,6 +175,29 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
     if (partialLastGroup) compute.partialThreads = partialGroups;
+    // Debug aid: APS5_TRACE_PROGRAM=<hex code address>[:n] prints every n-th (default 100th) dispatch
+    // of that program: group counts (an indirect one's read from its arguments), initiator, user data.
+    static const std::pair<std::uint64_t, std::uint64_t> traceProgram = [] {
+        const char* text = std::getenv("APS5_TRACE_PROGRAM");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        char* end = nullptr;
+        const auto program = std::strtoull(text, &end, 16);
+        const auto every = *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 100ull;
+        return std::pair<std::uint64_t, std::uint64_t>{program, std::max<std::uint64_t>(every, 1)};
+    }();
+    if (traceProgram.first != 0 && !resolving && address == traceProgram.first) {
+        static std::atomic<std::uint64_t> seen{0};
+        if (const auto index = seen.fetch_add(1, std::memory_order_relaxed); index % traceProgram.second == 0) {
+            const auto groups = indirectArguments != 0 ? readDispatchArguments(submission.queue, indirectArguments, packet[4]) : std::array<std::uint32_t, 5>{packet[0], packet[1], packet[2], packet[3], packet[4]};
+            std::string words;
+            for (const auto word : userData) {
+                char item[16];
+                std::snprintf(item, sizeof(item), " %08x", word);
+                words += item;
+            }
+            std::fprintf(stderr, "[program] 0x%llx dispatch %llu: groups %u x %u x %u, initiator 0x%x, indirect 0x%llx, threads %u x %u x %u, user data%s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(index), groups[1], groups[2], groups[3], packet[4], static_cast<unsigned long long>(indirectArguments), compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], words.c_str());
+        }
+    }
     std::array<std::uint32_t, 3> threadGroup{};
     if (indirectArguments != 0 && (packet[4] & 0x20u) != 0) {
         for (std::uint32_t axis = 0; axis < 3; ++axis) threadGroup[axis] = std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u);
@@ -463,7 +490,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     const std::uint64_t dispatchThreads = indirectArguments != 0 ? 0 : std::uint64_t{groups[0]} * groups[1] * groups[2] * compute.numThreads[0] * compute.numThreads[1] * compute.numThreads[2];
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
-    if (traceIo) {
+    if (traceIo && traceProgram.first == 0) {
 
         std::string words;
         if (std::getenv("APS5_TRACE_DISPATCH_IO")[0] == '2') {

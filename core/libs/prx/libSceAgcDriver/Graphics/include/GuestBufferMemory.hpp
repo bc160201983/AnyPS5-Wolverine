@@ -457,6 +457,12 @@ private:
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
         bool overlay = false;
+        // APS5_RESIDENT_STAGING: the write generation taken before this use's copy-in, and the one
+        // the shadow matches the import at after its copy-back (0: not proven); a reused build's
+        // next use skips the copy-in while UnchangedSince(region, residentGeneration) holds.
+        std::uint64_t copyInGeneration = 0;
+        mutable std::uint64_t residentGeneration = 0;
+        mutable bool residentCandidate = false;
     };
 
     // How [begin, end) lies against the space's base regions.

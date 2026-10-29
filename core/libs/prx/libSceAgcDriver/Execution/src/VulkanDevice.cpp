@@ -4442,6 +4442,23 @@ bool TraceDispatchIo() {
     return traceIo;
 }
 
+// With APS5_TRACE_PROGRAM=<hex code address>[:n] set too, only every n-th dispatch of that program.
+bool TraceDispatchIo(std::uint64_t programAddress) {
+    if (!TraceDispatchIo()) return false;
+    static const std::pair<std::uint64_t, std::uint64_t> filter = [] {
+        const char* text = std::getenv("APS5_TRACE_PROGRAM");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        char* end = nullptr;
+        const auto program = std::strtoull(text, &end, 16);
+        const auto every = *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 100ull;
+        return std::pair<std::uint64_t, std::uint64_t>{program, std::max<std::uint64_t>(every, 1)};
+    }();
+    if (filter.first == 0) return true;
+    if (programAddress != filter.first) return false;
+    static std::atomic<std::uint64_t> seen{0};
+    return seen.fetch_add(1, std::memory_order_relaxed) % filter.second == 0;
+}
+
 void WatchMemory(std::uint64_t programAddress) {
     struct Range {
         std::uint64_t address = 0;
@@ -5802,7 +5819,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
+    if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] 0x%llx %s:%s\n", static_cast<unsigned long long>(programAddress), groupsText, resources->Describe().c_str());
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
@@ -5941,7 +5958,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         state->recorder->Sync();
         timer.phase(PhaseSync);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());
+    if (TraceDispatchIo(programAddress)) std::fprintf(stderr, "[dispatch-io] 0x%llx %s:%s\n", static_cast<unsigned long long>(programAddress), groupsText, hit->resources->Describe().c_str());
     WatchMemory(programAddress);
     timer.finish(lookupsBefore, groupsText, indirect);
     if (profile) reportRecipes();

@@ -13,11 +13,50 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <bit>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+void noteDrainedStore(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, bool resolved, int reason) {
+    static std::mutex mutex;
+    static std::map<std::uint64_t, std::uint64_t> counts;
+    static auto last = std::chrono::steady_clock::now();
+    std::uint32_t source = 15, destination = 15;
+    std::uint64_t bytes = 0;
+    if (opcode == 0x50 && packet.size() >= 7) {
+        source = Pm4::DmaSource(packet);
+        destination = Pm4::DmaDestination(packet);
+        bytes = Pm4::DmaBytes(packet);
+    }
+    const auto bucket = bytes == 0 ? 0u : static_cast<std::uint64_t>(std::bit_width(bytes));
+    const auto key = static_cast<std::uint64_t>(opcode) | (static_cast<std::uint64_t>(queue & 0xffu) << 8u) | (static_cast<std::uint64_t>(source) << 16u) | (static_cast<std::uint64_t>(destination) << 20u) | (static_cast<std::uint64_t>(resolved) << 24u) | (static_cast<std::uint64_t>(reason + 1) << 28u) | (bucket << 32u);
+    std::lock_guard lock(mutex);
+    ++counts[key];
+    if (std::chrono::steady_clock::now() - last < std::chrono::seconds(10)) return;
+    last = std::chrono::steady_clock::now();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> sorted(counts.begin(), counts.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+    std::string text;
+    for (std::size_t i = 0; i < sorted.size() && i < 12; ++i) {
+        const auto k = sorted[i].first;
+        char item[160];
+        std::snprintf(item, sizeof(item), " [op 0x%02llx q 0x%02llx src %llu dst %llu resolved %llu reason %lld bytes<2^%llu: %llu]", static_cast<unsigned long long>(k & 0xffu), static_cast<unsigned long long>((k >> 8u) & 0xffu), static_cast<unsigned long long>((k >> 16u) & 0xfu), static_cast<unsigned long long>((k >> 20u) & 0xfu), static_cast<unsigned long long>((k >> 24u) & 1u), static_cast<long long>((k >> 28u) & 0xfu) - 1, static_cast<unsigned long long>(k >> 32u), static_cast<unsigned long long>(sorted[i].second));
+        text += item;
+    }
+    std::fprintf(stderr, "[drained-stores] 10 s:%s\n", text.c_str());
+    counts.clear();
+}
+}
 
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
@@ -119,6 +158,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
+        int storeReason = -1;
+        bool storeResolved = false;
         const auto copy = opcode == 0x50 ? Pm4::DecodeMemoryCopy(packet) : std::nullopt;
         const auto copyBehindPendingSource = [&] {
             if (!copy.has_value() || copy->bytes > gpuStoreLimit || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
@@ -137,11 +178,30 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (outcome.path != 1 && outcome.path != 3) throw std::runtime_error("AGC driver: a DMA_DATA copy of up to 64 KiB that GpuCopyPossible accepted took copy path " + std::to_string(outcome.path));
             return true;
         };
+        static const bool gdsStores = std::getenv("APS5_GDS_GPU_STORES") != nullptr;
+        const auto resolveStore = [&]() -> std::optional<Pm4::StoreWrite> {
+            if (auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) return store;
+            if (!gdsStores || opcode != 0x50 || packet.size() < 7 || Pm4::DmaDestination(packet) != Pm4::DmaSelectGds) return std::nullopt;
+            const auto source = Pm4::DmaSource(packet);
+            const std::size_t bytes = Pm4::DmaBytes(packet);
+            const std::uint64_t offset = packet[4];
+            if (bytes == 0 || bytes > gpuStoreLimit || offset % 4 != 0 || bytes % 4 != 0 || offset > Pm4::GdsBytes || bytes > Pm4::GdsBytes - offset) return std::nullopt;
+            std::vector<std::byte> data(bytes);
+            if (source == Pm4::DmaSourceData) {
+                for (std::size_t i = 0; i < bytes; ++i) data[i] = static_cast<std::byte>(packet[2] >> ((i % 4) * 8));
+            } else if (source == 0 || source == 3) {
+                GuestMemory::Read(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), data);
+            } else {
+                return std::nullopt;
+            }
+            return Pm4::StoreWrite{Pm4::GdsAddress() + offset, {}, std::move(data)};
+        };
         if (copyBehindPendingSource()) {
             ++copiesBehindPendingSources;
             wroteOnGpu = true;
             drained = false;
-        } else if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        } else if (const auto store = resolveStore()) {
+            storeResolved = true;
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
@@ -158,6 +218,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
+                storeReason = reason;
                 if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
@@ -206,6 +267,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             }
         }
         if (drained) ++storesDrained;
+        if (drained && profile) noteDrainedStore(packet, opcode, submission.queue, storeResolved, storeReason);
     }
 
     static const bool drawDrain = std::getenv("APS5_DRAW_DRAIN") != nullptr;

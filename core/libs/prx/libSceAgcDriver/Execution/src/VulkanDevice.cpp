@@ -2589,6 +2589,21 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     return 0;
 }
 
+int VulkanDevice::WriteStoreOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
+    auto& recorder = *state->recorder;
+    if (recorder.Idle()) return 1;
+    if (state->CopiedWriterOverlaps(address, bytes.size()) || (Graphics::Recorder::PendingCompletionStores() != 0 && recorder.CompletionLabelIn(address, bytes.size())) || recorder.PendingLabelIn(address, bytes.size())) return WriteLabelOnGpu(address, bytes, stamp, queue);
+    const auto context = graphicsContext();
+    const auto* import = Graphics::HostImportFor(context, address, bytes.size());
+    if (import == nullptr) return 3;
+    if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    recorder.RecordStore(import->buffer, Graphics::HostImportOffset(*import, address), bytes, address);
+    recorder.NotePendingWrite(address, bytes.size());
+    GuestMemory::MarkWritten(address, bytes.size());
+    return 0;
+}
+
 bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {
     if (!state->recorder) return false;
     if (reapFirst && OpportunisticReap()) state->recorder->Reap();

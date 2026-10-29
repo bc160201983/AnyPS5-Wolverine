@@ -41,6 +41,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -3420,7 +3421,31 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
+    const bool dispatchWriter = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
+    const bool drawWriter = !dispatchWriter && overlaps(*drawWriters);
+    if (dispatchWriter || drawWriter || (labels && recorder->PendingLabelIn(address, bytes))) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) {
+            static AgcDriver::Mutex mutex;
+            static std::map<std::tuple<std::uint64_t, int>, std::uint64_t> counts;
+            static auto last = std::chrono::steady_clock::now();
+            std::lock_guard lock(mutex);
+            ++counts[{address & ~std::uint64_t{0xffff}, dispatchWriter ? 0 : drawWriter ? 1 : 2}];
+            if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(10)) {
+                last = std::chrono::steady_clock::now();
+                std::vector<std::pair<std::tuple<std::uint64_t, int>, std::uint64_t>> sorted(counts.begin(), counts.end());
+                std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+                std::string text;
+                for (std::size_t i = 0; i < sorted.size() && i < 10; ++i) {
+                    char item[96];
+                    static constexpr const char* kinds[] = {"dispatch", "draw", "label"};
+                    std::snprintf(item, sizeof(item), " 0x%llx %s x%llu", static_cast<unsigned long long>(std::get<0>(sorted[i].first)), kinds[std::get<1>(sorted[i].first)], static_cast<unsigned long long>(sorted[i].second));
+                    text += item;
+                }
+                std::fprintf(stderr, "[cpuwrite-sync] 10 s (64 KiB block, writer kind, count), GDS at 0x%llx:%s\n", static_cast<unsigned long long>(Pm4::GdsAddress()), text.c_str());
+                counts.clear();
+            }
+        }
         Recorder::CountSync(4);
         recorder->SyncThrough(address, bytes);
         return true;

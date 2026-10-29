@@ -160,6 +160,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         bool drained = true;
         int storeReason = -1;
         bool storeResolved = false;
+        static const bool gdsStores = std::getenv("APS5_GDS_GPU_STORES") != nullptr;
+        static const bool gdsPlainStores = std::getenv("APS5_GDS_PLAIN_STORES") != nullptr;
+        bool gdsStore = false;
         const auto copy = opcode == 0x50 ? Pm4::DecodeMemoryCopy(packet) : std::nullopt;
         const auto copyBehindPendingSource = [&] {
             if (!copy.has_value() || copy->bytes > gpuStoreLimit || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
@@ -178,7 +181,6 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (outcome.path != 1 && outcome.path != 3) throw std::runtime_error("AGC driver: a DMA_DATA copy of up to 64 KiB that GpuCopyPossible accepted took copy path " + std::to_string(outcome.path));
             return true;
         };
-        static const bool gdsStores = std::getenv("APS5_GDS_GPU_STORES") != nullptr;
         const auto resolveStore = [&]() -> std::optional<Pm4::StoreWrite> {
             if (auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) return store;
             if (!gdsStores || opcode != 0x50 || packet.size() < 7 || Pm4::DmaDestination(packet) != Pm4::DmaSelectGds) return std::nullopt;
@@ -194,6 +196,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             } else {
                 return std::nullopt;
             }
+            gdsStore = true;
             return Pm4::StoreWrite{Pm4::GdsAddress() + offset, {}, std::move(data)};
         };
         if (copyBehindPendingSource()) {
@@ -217,9 +220,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
-                const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
+                const bool plain = gdsStore && gdsPlainStores;
+                const auto reason = localDevice == nullptr ? 4 : plain ? localDevice->WriteStoreOnGpu(store->address, bytes, stamp, submission.queue) : localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue);
                 storeReason = reason;
-                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
+                if (reason == 1 || reason == 5 || (reason == 0 && !plain)) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
                     else ++storesBehindCompletions;

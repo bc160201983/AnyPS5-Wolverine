@@ -224,6 +224,7 @@ public:
         std::lock_guard lock(mutex);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
+            if (it->second.resident) disarmRun(it->first, allSubpages);
             it->second.protection = protection;
             it->second.armed = 0;
             invalidate(it->first, it->second);
@@ -235,6 +236,11 @@ public:
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             if (it->second.resident) {
                 ++it->second.pins;
+                if (it->second.armed != 0) {
+                    protectSubpages(it->first, it->second.armed, it->second.protection, "pin resident guest page writable", it->second.viewBytes);
+                    disarmRun(it->first, it->second.armed);
+                    it->second.armed = 0;
+                }
                 invalidate(it->first, it->second);
                 continue;
             }
@@ -309,6 +315,14 @@ public:
         if (found == views.end() || !writable(found->second.protection)) return false;
         auto& view = found->second;
         if (view.resident) {
+            const auto alarm = static_cast<std::uint8_t>(view.armed & subpagesOf(base, address, address + 1));
+            if (alarm != 0) {
+                protectSubpages(base, alarm, view.protection, "resume resident guest write", view.viewBytes);
+                view.armed &= static_cast<std::uint8_t>(~alarm);
+                disarmRun(base, alarm);
+                ++alarmFaults;
+                return true;
+            }
             const auto memory = query(address);
             return memory.State == MEM_COMMIT && writable(memory.Protect & 0xffu);
         }
@@ -317,6 +331,12 @@ public:
         protectSubpages(base, written, view.protection, "resume shared memory write", view.viewBytes);
         view.armed &= static_cast<std::uint8_t>(~written);
         return true;
+    }
+
+    void AlarmStats(std::uint64_t* skips, std::uint64_t* faults) {
+        std::lock_guard lock(mutex);
+        *skips = alarmSkips;
+        *faults = alarmFaults;
     }
 
     bool HandleRead(std::uintptr_t address) {
@@ -365,6 +385,7 @@ public:
             if (opened == 0) continue;
             protectSubpages(it->first, opened, view.protection, "open shared memory to a host write", view.viewBytes);
             view.armed &= static_cast<std::uint8_t>(~opened);
+            if (view.resident) disarmRun(it->first, opened);
         }
         return true;
     }
@@ -741,6 +762,7 @@ private:
         std::uint32_t fresh;
         std::uintptr_t key;
         std::uint64_t offset;
+        std::array<std::uint64_t, 8> alarmed{};
     };
     struct Window {
         void* view = nullptr;
@@ -752,8 +774,72 @@ private:
         return (run.collected[bit >> 6] >> (bit & 63) & 1) != 0;
     }
 
+    static bool writeAlarms() {
+        static const bool enabled = [] {
+            const char* text = std::getenv("APS5_WRITE_ALARMS");
+            return text != nullptr && text[0] != '0' && text[0] != 0;
+        }();
+        return enabled;
+    }
+
+    static bool runAlarmed(const Run& run, std::size_t bit) {
+        return (run.alarmed[bit >> 6] >> (bit & 63) & 1) != 0;
+    }
+
+    void disarmRun(std::uintptr_t base, std::uint8_t mask) {
+        if (mask == 0 || residentRuns.empty()) return;
+        auto run = residentRuns.upper_bound(base);
+        if (run == residentRuns.begin()) return;
+        --run;
+        if (base >= run->second.end) return;
+        for (std::size_t sub = 0; sub < subpages; ++sub) {
+            if ((mask & (1u << sub)) == 0) continue;
+            const auto at = base + sub * subpageBytes;
+            if (at < run->first || at >= run->second.end) continue;
+            const auto bit = (at - run->first) >> 12;
+            run->second.alarmed[bit >> 6] &= ~(1ull << (bit & 63));
+        }
+    }
+
+    bool allAlarmed(std::uintptr_t start, const Run& run, std::uintptr_t first, std::uintptr_t stop) const {
+        for (auto at = first; at < stop; at += 4096) {
+            if (!runAlarmed(run, (at - start) >> 12)) return false;
+        }
+        return true;
+    }
+
+    void armRun(std::uintptr_t start, Run& run, std::uintptr_t first, std::uintptr_t stop) {
+        for (auto it = views.lower_bound(first & ~(pageBytes - 1)); it != views.end() && it->first < stop; ++it) {
+            auto& view = it->second;
+            if (!view.resident || view.pins != 0 || view.hostWrites != 0 || view.hostImports != 0 || !writable(view.protection)) continue;
+            std::uint8_t mask = 0;
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                const auto at = it->first + sub * subpageBytes;
+                if (at < first || at >= stop || at < start || at >= run.end || (sub + 1) * subpageBytes > view.viewBytes) continue;
+                if ((view.armed & (1u << sub)) != 0) continue;
+                mask |= static_cast<std::uint8_t>(1u << sub);
+            }
+            if (mask == 0) continue;
+            const DWORD protection = view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+            protectSubpages(it->first, mask, protection, "arm resident write alarm", view.viewBytes);
+            view.armed |= mask;
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                if ((mask & (1u << sub)) == 0) continue;
+                const auto bit = (it->first + sub * subpageBytes - start) >> 12;
+                run.alarmed[bit >> 6] |= 1ull << (bit & 63);
+            }
+        }
+    }
+
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
+        if (writeAlarms() && clear && collection == Collection::All && run.fresh == 0) {
+            if (allAlarmed(start, run, first, stop)) {
+                ++alarmSkips;
+                return;
+            }
+            armRun(start, run, first, stop);
+        }
         if (run.fresh == 0 && collection != Collection::Fresh) {
             ULONG_PTR reported = (stop - first + 4095) / 4096;
             DWORD granularity = 0;
@@ -1262,6 +1348,8 @@ private:
     }
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::shared_ptr<Physical>> physical;
     std::map<std::uintptr_t, Run> residentRuns;
+    std::uint64_t alarmSkips = 0;
+    std::uint64_t alarmFaults = 0;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::map<std::uintptr_t, Run>::iterator> residentIndex;
     std::vector<std::shared_ptr<Saved>> savedPool;
     std::size_t savedPoolBytes = 0;

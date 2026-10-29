@@ -97,6 +97,7 @@ std::atomic<std::uint64_t> forgetCalls{0};
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+std::atomic<std::uint64_t> writtenPagesFound{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -331,6 +332,14 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" written pages found %llu,", static_cast<unsigned long long>(writtenPagesFound.load()));
+#ifdef _WIN32
+        {
+            std::uint64_t alarmSkips = 0, alarmFaults = 0;
+            GuestArena::GuestArenaWriteAlarmStats_nid_postfix(&alarmSkips, &alarmFaults);
+            AgcDriver::ProfilePrint_nid_no_patch(" write alarms: %llu collects skipped, %llu faults,", static_cast<unsigned long long>(alarmSkips), static_cast<unsigned long long>(alarmFaults));
+        }
+#endif
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -1481,6 +1490,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     else {
         const auto generation = tracker.generation.load(std::memory_order_relaxed);
         noteWrittenRun(runs, begin, end, generation);
+        writtenPagesFound.fetch_add((end - begin + 4095) / 4096, std::memory_order_relaxed);
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, runs.kind);
     }
 #ifndef _WIN32

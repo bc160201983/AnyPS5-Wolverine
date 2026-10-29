@@ -421,6 +421,10 @@ bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }
 
+void GuestArenaWriteAlarmStats_nid_postfix(std::uint64_t* skips, std::uint64_t* faults) {
+    WindowsMappings::Get().AlarmStats(skips, faults);
+}
+
 namespace {
 
 struct Traps {

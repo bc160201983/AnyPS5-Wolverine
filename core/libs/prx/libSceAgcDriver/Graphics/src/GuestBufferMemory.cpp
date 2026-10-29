@@ -5095,6 +5095,8 @@ struct CopyStats {
     std::atomic<std::uint64_t> gpuCopies{0};
     std::atomic<std::uint64_t> gpuCopyBytes{0};
     std::atomic<std::uint64_t> gpuCopyBacks{0};
+    std::atomic<std::uint64_t> shadowCopyIns{0};
+    std::atomic<std::uint64_t> shadowCopyInsSkipped{0};
     std::atomic<std::uint64_t> gpuCopyBackBytes{0};
     // Written gpuCopy regions of a use that recorded no copy-back (a synchronous draw): stored
     // from the staging buffer by the CPU in WriteBack.
@@ -5799,7 +5801,24 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         std::shared_ptr<Buffer> inputSnapshot;
         auto copySource = region->copySource;
         auto copyOffset = region->begin - region->copySourceBase;
-        if (!pendingWriter && !writable) {
+        std::shared_ptr<Buffer> producer;
+        VkDeviceSize producerOffset = 0;
+        if (CopyInFromShadows()) producer = GpuProducedShadow(address, static_cast<std::size_t>(bytes), 0, &producerOffset);
+        if (producer != nullptr && producer == region->buffer) {
+            if (producerOffset == 0) {
+                Copies().shadowCopyInsSkipped.fetch_add(1, std::memory_order_relaxed);
+                recorder->Keep(region->buffer);
+                region->snapshot.clear();
+                continue;
+            }
+            producer.reset();
+        }
+        if (producer != nullptr) {
+            copySource = producer->Handle();
+            copyOffset = producerOffset;
+            recorder->Keep(producer);
+            Copies().shadowCopyIns.fetch_add(1, std::memory_order_relaxed);
+        } else if (!pendingWriter && !writable) {
             inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
             copySource = inputSnapshot->Handle();
@@ -5851,6 +5870,12 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
     }
     if (stagedAny) reportStaging();
+    if (profile && CopyInFromShadows()) {
+        static std::atomic<std::int64_t> lastReport{0};
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto previous = lastReport.load(std::memory_order_relaxed);
+        if (now - previous >= 10 && lastReport.compare_exchange_strong(previous, now)) std::fprintf(stderr, "[copy-in-shadows] cumulative: %llu copy-ins from a producer's video-memory shadow, %llu skipped (shadow already in place)\n", static_cast<unsigned long long>(Copies().shadowCopyIns.load()), static_cast<unsigned long long>(Copies().shadowCopyInsSkipped.load()));
+    }
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide).
@@ -6257,8 +6282,16 @@ bool ReadGpuProducedShadows() {
     return enabled;
 }
 
+bool CopyInFromShadows() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_COPY_IN_FROM_SHADOWS");
+        return text != nullptr && text[0] != '0' && text[0] != 0;
+    }();
+    return enabled;
+}
+
 void NoteGpuProduced(std::uint64_t begin, std::uint64_t end, std::uint64_t generation, std::shared_ptr<Buffer> shadow, std::uint64_t shadowBase) {
-    if ((!SkipGpuProducedSnapshots() && !ReadGpuProducedShadows()) || begin >= end || generation == 0) return;
+    if ((!SkipGpuProducedSnapshots() && !ReadGpuProducedShadows() && !CopyInFromShadows()) || begin >= end || generation == 0) return;
     auto& state = gpuProduced();
     std::lock_guard lock(state.mutex);
     if (state.ranges.size() >= 65536) state.ranges.clear();
@@ -6292,7 +6325,7 @@ bool GpuProducedUnchanged(std::uint64_t address, std::size_t bytes) {
 }
 
 std::shared_ptr<Buffer> GpuProducedShadow(std::uint64_t address, std::size_t bytes, VkDeviceSize alignment, VkDeviceSize* offset) {
-    if (!ReadGpuProducedShadows() || bytes == 0) return nullptr;
+    if ((!ReadGpuProducedShadows() && !CopyInFromShadows()) || bytes == 0) return nullptr;
     const auto entry = gpuProducedCovering(address, bytes);
     if (!entry.has_value() || entry->shadow == nullptr || address < entry->shadowBase) return nullptr;
     const auto at = static_cast<VkDeviceSize>(address - entry->shadowBase);

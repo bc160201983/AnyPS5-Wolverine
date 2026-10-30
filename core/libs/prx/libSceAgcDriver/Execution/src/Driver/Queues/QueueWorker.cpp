@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -141,6 +142,7 @@ void Driver::run(std::uint32_t id) noexcept {
     PinWorkerThread(role);
 
     GuestMemory::TagGpuLockThread(id);
+    Graphics::Recorder::SetThreadLane(id == 0x40u || id == 0x48u ? 1u : 0u);
     static const std::uint32_t sampledQueue = [] {
         const char* text = std::getenv("APS5_SAMPLE_QUEUE");
         return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 16)) : 0u;

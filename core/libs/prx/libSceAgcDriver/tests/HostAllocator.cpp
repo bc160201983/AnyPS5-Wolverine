@@ -61,7 +61,7 @@ void SizedDeletesKeepTheirClass() {
             ::operator delete(block, size);
         }
     }
-    for (std::size_t size = 1; size <= 1024; ++size) {
+    for (std::size_t size = 1; size <= 4096; ++size) {
         auto* block = static_cast<unsigned char*>(::operator new(size));
         FillAndVerify(block, size, 3);
         ::operator delete(block, size);

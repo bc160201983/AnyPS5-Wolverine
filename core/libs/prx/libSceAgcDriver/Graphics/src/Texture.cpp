@@ -276,6 +276,18 @@ bool BlockTrackingEnabled() {
     return !disabled;
 }
 
+bool LinearBlockTrackingEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_LINEAR_BLOCK_TRACKING");
+        return text != nullptr && text[0] != 0 && text[0] != '0';
+    }();
+    return enabled;
+}
+
+std::array<std::uint32_t, 3> StorageWindowBlock(TextureTileMode tileMode, std::uint32_t elementBytes) {
+    return tileMode == TextureTileMode::kLinear ? std::array<std::uint32_t, 3>{elementBytes, 1u, 1u} : ThinBlockLayout(tileMode, elementBytes);
+}
+
 struct PhaseTimer {
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     double lap() {
@@ -1492,7 +1504,8 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         const bool layered = geometry.layers >= 2 && !geometry.thick && geometry.imageDepth == 1 && geometry.layers == geometry.imageLayers && geometry.layerBytes * geometry.layers == guestBytes && geometry.layerBytes % 65536 == 0 && descriptor.baseAddress % 65536 == 0;
         // Tile blocks divide the stamp blocks, so at an aligned base every unit is whole tile blocks
         // of its (layer, mip) slices (sliceWindows).
-        blockUnits = LayerTrackingEnabled() && BlockTrackingEnabled() && !geometry.thick && descriptor.tileMode != TextureTileMode::kLinear && descriptor.baseAddress % 65536 == 0;
+        const bool linearUnits = LinearBlockTrackingEnabled() && geometry.imageDepth == 1;
+        blockUnits = LayerTrackingEnabled() && BlockTrackingEnabled() && !geometry.thick && (descriptor.tileMode != TextureTileMode::kLinear || linearUnits) && descriptor.baseAddress % 65536 == 0;
         trackedLayers = blockUnits ? static_cast<std::uint32_t>((guestBytes + 65535) / 65536) : layered && LayerTrackingEnabled() ? geometry.layers : 1u;
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
@@ -3017,7 +3030,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::unitRuns(co
 std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const {
     std::vector<SliceWindow> windows;
     const auto elementBytes = BytesPerElement(descriptor.format);
-    const auto block = ThinBlockLayout(descriptor.tileMode, elementBytes);
+    const auto block = StorageWindowBlock(descriptor.tileMode, elementBytes);
     for (const auto& [runBegin, runEnd] : runs) {
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
@@ -3490,7 +3503,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         std::size_t last;
     };
     std::vector<SlabRetile> slabRetiled;
-    const auto blockBytes = ThinBlockLayout(descriptor.tileMode, elementBytes)[0];
+    const auto blockBytes = StorageWindowBlock(descriptor.tileMode, elementBytes)[0];
     for (std::size_t i = 0; i < windows.size(); ++i) {
         const auto& window = windows[i];
         // The tail levels follow each other, sharing the previous one's region.

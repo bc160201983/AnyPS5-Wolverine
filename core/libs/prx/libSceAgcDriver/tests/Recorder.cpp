@@ -6931,6 +6931,10 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
         std::uint32_t pipeBankXor = 0;
     };
     constexpr Case cases[] = {
+        {"R8 linear 300x170", 1, TextureTileMode::kLinear, 300, 170, 1},
+        {"R16 linear 257x129, 3 mips", 7, TextureTileMode::kLinear, 257, 129, 3},
+        {"RGBA8 linear 520x260", 56, TextureTileMode::kLinear, 520, 260, 1},
+        {"RGBA16F linear 385x257, 3 mips", 71, TextureTileMode::kLinear, 385, 257, 3},
         {"R8 64 KiB R_X 200x150", 1, TextureTileMode::kR64KBX, 200, 150, 1},
         {"R16 64 KiB R_X 200x150, 3 mips", 7, TextureTileMode::kR64KBX, 200, 150, 3},
         {"RGBA8 64 KiB R_X 520x260, 6 mips", 56, TextureTileMode::kR64KBX, 520, 260, 6},
@@ -7096,7 +7100,8 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
             results[mode].moves = StorageTexture::SinglePassMoves() - movesBefore;
             if (results[mode].reuploaded != texels) failures += what + (mode == 1 ? " (single pass)" : " (copies)") + ": the second image does not hold the texels written back\n";
         }
-        if (results[0].moves != 0 || results[1].moves < 3) failures += what + ": single-pass moves " + std::to_string(results[0].moves) + " with the copies and " + std::to_string(results[1].moves) + " in single pass (want 0 and at least 3)\n";
+        const auto minimumMoves = test.tileMode == TextureTileMode::kLinear ? 2u : 3u;
+        if (results[0].moves != 0 || results[1].moves < minimumMoves) failures += what + ": single-pass moves " + std::to_string(results[0].moves) + " with the copies and " + std::to_string(results[1].moves) + " in single pass (want 0 and at least " + std::to_string(minimumMoves) + ")\n";
         if (results[0].uploaded != results[1].uploaded) failures += what + ": the first upload differs between the copies and single pass\n";
         if (results[0].memory != results[1].memory) {
             std::size_t differ = 0;

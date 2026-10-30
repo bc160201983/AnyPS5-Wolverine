@@ -575,7 +575,14 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     try {
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        if (allocation.allocationBytes > tier.budget) {
+        static const bool shedOverBudget = [] {
+            const char* text = std::getenv("APS5_POOL_SHED_OVER_BUDGET");
+            return text != nullptr && text[0] != 0 && text[0] != '0';
+        }();
+        if (shedOverBudget && &tier == &deviceTier && heapOverBudget()) {
+            while (deviceTier.slots != 0) evictOldest(deviceTier, evicted);
+            evicted.push_back(allocation);
+        } else if (allocation.allocationBytes > tier.budget) {
             evicted.push_back(allocation);
         } else {
             while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);

@@ -104,6 +104,10 @@ void DestroyDeferredAtIdle(const Context& context, std::chrono::steady_clock::ti
         if (objects == 0 || (objects < DrainObjects && now - found->second.oldest < DrainAge)) return;
     }
     const auto idle = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    if (context.computeQueue != VK_NULL_HANDLE && idle == VK_SUCCESS) {
+        const auto computeIdle = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.computeQueue);
+        if (computeIdle != VK_SUCCESS && computeIdle != VK_ERROR_DEVICE_LOST) throw std::runtime_error("AGC graphics: vkQueueWaitIdle (compute lane) before destroying deferred objects: Vulkan result " + std::to_string(computeIdle));
+    }
     if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) throw std::runtime_error("AGC graphics: vkQueueWaitIdle before destroying deferred objects: Vulkan result " + std::to_string(idle));
     Deferred taken;
     {

@@ -1593,6 +1593,21 @@ void Recorder::SetThreadLane(std::uint8_t lane) {
     threadLane = lane;
 }
 
+bool Recorder::ComputeQueueEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_COMPUTE_QUEUE");
+        return ComputeLanesEnabled() && text != nullptr && text[0] != '0' && text[0] != 0;
+    }();
+    return enabled;
+}
+
+bool Recorder::NewestTimelinePoint(VkSemaphore* semaphore, std::uint64_t* value) const {
+    if (timeline == VK_NULL_HANDLE || submissions == 0) return false;
+    *semaphore = timeline;
+    *value = submissions;
+    return true;
+}
+
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (open != nullptr && ComputeLanesEnabled() && open->lane != threadLane) {
@@ -3703,13 +3718,30 @@ void Recorder::Submit() {
     VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
     const VkSemaphore hold = std::exchange(submitHold, VK_NULL_HANDLE);
     const std::uint64_t holdValue = submitHoldValue;
-    VkPipelineStageFlags holdStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    std::array<VkSemaphore, 2> waitSemaphores{};
+    std::array<std::uint64_t, 2> waitValues{};
+    std::array<VkPipelineStageFlags, 2> waitStages{};
+    std::uint32_t waitCount = 0;
     if (hold != VK_NULL_HANDLE) {
-        submission.waitSemaphoreCount = 1;
-        submission.pWaitSemaphores = &hold;
-        submission.pWaitDstStageMask = &holdStage;
-        timelineInfo.waitSemaphoreValueCount = 1;
-        timelineInfo.pWaitSemaphoreValues = &holdValue;
+        waitSemaphores[waitCount] = hold;
+        waitValues[waitCount] = holdValue;
+        waitStages[waitCount++] = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    }
+    VkQueue targetQueue = context.queue;
+    if (ComputeQueueEnabled() && context.computeQueue != VK_NULL_HANDLE && timeline != VK_NULL_HANDLE) {
+        if (batch->lane == 1) targetQueue = context.computeQueue;
+        if (submissions != 0 && lastSubmittedLane != batch->lane) {
+            waitSemaphores[waitCount] = timeline;
+            waitValues[waitCount] = submissions;
+            waitStages[waitCount++] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        }
+    }
+    if (waitCount != 0) {
+        submission.waitSemaphoreCount = waitCount;
+        submission.pWaitSemaphores = waitSemaphores.data();
+        submission.pWaitDstStageMask = waitStages.data();
+        timelineInfo.waitSemaphoreValueCount = waitCount;
+        timelineInfo.pWaitSemaphoreValues = waitValues.data();
     }
     if (timeline != VK_NULL_HANDLE) {
         timelineInfo.signalSemaphoreValueCount = 1;
@@ -3717,10 +3749,10 @@ void Recorder::Submit() {
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
     }
-    if (hold != VK_NULL_HANDLE || timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
+    if (waitCount != 0 || timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    const auto result = function(queueSubmit, "vkQueueSubmit")(targetQueue, 1, &submission, batch->fence);
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
@@ -3728,6 +3760,7 @@ void Recorder::Submit() {
     Check(result, "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    lastSubmittedLane = batch->lane;
     batch->submittedAt = std::chrono::steady_clock::now();
     CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch->serial), tokensStr.c_str());
     if (DrawProfiled()) {

@@ -202,6 +202,7 @@ struct Context {
     std::uint32_t queueFamily = 0;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
+    VkQueue computeQueue = VK_NULL_HANDLE;
     std::mutex* sparseQueueMutex = nullptr;
     VkQueue settleQueue = VK_NULL_HANDLE;
     VkCommandPool settlePool = VK_NULL_HANDLE;

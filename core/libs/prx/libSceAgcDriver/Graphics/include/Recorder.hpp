@@ -427,6 +427,8 @@ public:
     static bool ComputeLanesEnabled();
     static std::uint8_t CallerLane();
     static void SetThreadLane(std::uint8_t lane);
+    static bool ComputeQueueEnabled();
+    bool NewestTimelinePoint(VkSemaphore* semaphore, std::uint64_t* value) const;
     VkDevice Device() const { return context.device; }
     // Whether the calling thread runs inside a batch's completion action (finish()): a store made
     // there must not have a publish recorded for it (UnitShadow), see SyncThrough.
@@ -860,6 +862,7 @@ private:
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
+    std::uint8_t lastSubmittedLane = 0;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;

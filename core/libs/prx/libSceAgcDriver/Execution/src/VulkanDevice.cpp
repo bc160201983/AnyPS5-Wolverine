@@ -451,6 +451,7 @@ struct VulkanDevice::State {
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     std::uint32_t sparseIndex = 0;
     VkQueue sparseQueue = VK_NULL_HANDLE;
+    VkQueue computeQueue = VK_NULL_HANDLE;
     std::mutex sparseQueueMutex;
     VkQueue settleQueue = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
@@ -1716,7 +1717,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     queueInfo.queueFamilyIndex = family;
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &priority;
-    const float priorities[3]{1.0f, 1.0f, 1.0f};
+    const float priorities[4]{1.0f, 1.0f, 1.0f, 1.0f};
 #ifdef _WIN32
     const bool settles = true;
 #else
@@ -1769,7 +1770,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     const auto settleIndex = plan.settleIndex;
     VkDeviceQueueCreateInfo queueInfos[3]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
     queueInfos[0].queueCount = plan.mainCount;
-    queueInfos[0].pQueuePriorities = plan.mainCount > 1 ? priorities : &priority;
+    std::uint32_t computeIndex = 0;
+    if (Graphics::Recorder::ComputeQueueEnabled() && family < queues.size() && queues[family].queueCount > plan.mainCount && plan.mainCount < 4) {
+        computeIndex = plan.mainCount;
+        queueInfos[0].queueCount = plan.mainCount + 1;
+    }
+    queueInfos[0].pQueuePriorities = queueInfos[0].queueCount > 1 ? priorities : &priority;
     deviceInfo.queueCreateInfoCount = 1;
     const auto addQueue = [&](std::uint32_t queueFamily, std::uint32_t index) {
         for (std::uint32_t info = 1; info < deviceInfo.queueCreateInfoCount; ++info) {
@@ -2146,6 +2152,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     state->queueFamily = family;
+    if (computeIndex != 0) {
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, computeIndex, &state->computeQueue);
+        APS5_LOG_OUT("Compute-lane queue family=%u index=%u", family, computeIndex);
+    }
     if (plan.present) {
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, plan.presentIndex, &state->presentQueue);
         APS5_LOG_OUT("Presentation queue family=%u index=%u", family, plan.presentIndex);
@@ -3852,6 +3862,18 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     submit.pCommandBuffers = &commands;
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &rendered;
+    VkTimelineSemaphoreSubmitInfoKHR laneTimeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+    VkSemaphore laneSemaphore = VK_NULL_HANDLE;
+    std::uint64_t laneValue = 0;
+    const VkPipelineStageFlags laneStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (state->computeQueue != VK_NULL_HANDLE && state->recorder && state->recorder->NewestTimelinePoint(&laneSemaphore, &laneValue)) {
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &laneSemaphore;
+        submit.pWaitDstStageMask = &laneStage;
+        laneTimeline.waitSemaphoreValueCount = 1;
+        laneTimeline.pWaitSemaphoreValues = &laneValue;
+        submit.pNext = &laneTimeline;
+    }
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
@@ -4174,6 +4196,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.queueFamily = state->queueFamily;
     context.sparseFamily = state->sparseFamily;
     context.sparseQueue = state->sparseQueue;
+    context.computeQueue = state->computeQueue;
     context.sparseQueueMutex = &state->sparseQueueMutex;
     context.settleQueue = state->settlePool != VK_NULL_HANDLE ? state->settleQueue : VK_NULL_HANDLE;
     context.settlePool = state->settlePool;

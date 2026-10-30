@@ -3423,7 +3423,12 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     };
     const bool dispatchWriter = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
     const bool drawWriter = !dispatchWriter && overlaps(*drawWriters);
-    if (dispatchWriter || drawWriter || (labels && recorder->PendingLabelIn(address, bytes))) {
+    static const bool completionLabelsOnly = [] {
+        const char* text = std::getenv("APS5_SYNC_COMPLETION_LABELS_ONLY");
+        return text != nullptr && text[0] != 0 && text[0] != '0';
+    }();
+    const bool labelWait = labels && (completionLabelsOnly ? recorder->CompletionLabelIn(address, bytes) : recorder->PendingLabelIn(address, bytes));
+    if (dispatchWriter || drawWriter || labelWait) {
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         if (profile) {
             static AgcDriver::Mutex mutex;

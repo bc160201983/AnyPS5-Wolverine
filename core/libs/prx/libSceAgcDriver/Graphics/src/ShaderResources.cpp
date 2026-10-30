@@ -1309,7 +1309,12 @@ std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
     const auto budget = reported->heapBudget[*heap];
     const auto usage = reported->heapUsage[*heap];
     const auto reserved = usage - std::min<std::uint64_t>(usage, textureBytes) + std::max(TextureCacheBudget(memory), storageBytes) + budget / 8u;
-    return std::max<std::uint64_t>(2048ull << 20u, budget > reserved ? budget - reserved : 0u);
+    static const std::uint64_t floor = [] {
+        const char* text = std::getenv("APS5_SAMPLED_BUDGET_FLOOR_MIB");
+        const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return std::max<std::uint64_t>(2048ull, mib) << 20u;
+    }();
+    return std::max<std::uint64_t>(floor, budget > reserved ? budget - reserved : 0u);
 }
 
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport) {

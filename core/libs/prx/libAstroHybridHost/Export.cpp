@@ -8,11 +8,32 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
+#include "prx/libScePad/include/PadState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 
 namespace {
 
-constexpr std::uint32_t KytyGpuAbiVersion = (1u << 16u) | 1u;
+constexpr std::uint32_t KytyGpuAbiVersion = (1u << 16u) | 2u;
+
+struct PadTouch {
+    std::uint16_t x;
+    std::uint16_t y;
+    std::uint8_t id;
+    std::uint8_t active;
+    std::uint8_t reserved[2];
+};
+
+struct PadState {
+    std::uint32_t buttons;
+    std::uint8_t sticks[4];
+    std::uint8_t l2;
+    std::uint8_t r2;
+    std::uint8_t connected;
+    std::uint8_t reserved;
+    PadTouch touch[2];
+};
+
+static_assert(sizeof(PadState) == 28);
 constexpr std::uint32_t EventEopInterrupt = 1;
 constexpr std::uint32_t EventFlip = 2;
 constexpr std::int16_t FilterGraphicsCore = -14;
@@ -32,9 +53,10 @@ struct HostCallbacks {
     int (*queryMemory)(void* user, std::uint64_t address, std::uint64_t* base, std::uint64_t* size, std::uint32_t* flags, const void** alias);
     const char* (*app0Path)(void* user);
     int (*donateGuestRange)(void* user, std::uint64_t size, std::uint64_t* base);
+    void (*publishPad)(void* user, int port, const PadState* state);
 };
 
-static_assert(sizeof(HostCallbacks) == 72);
+static_assert(sizeof(HostCallbacks) == 80);
 
 struct Registration {
     KernelEqueue eq;
@@ -130,7 +152,23 @@ int DonateGuestRange(void*, std::uint64_t size, std::uint64_t* base) {
     return 0;
 }
 
-const HostCallbacks g_callbacks{sizeof(HostCallbacks), KytyGpuAbiVersion, nullptr, Log, AddGpuEvent, DeleteGpuEvent, DeliverEvent, nullptr, nullptr, DonateGuestRange};
+void PublishPad(void*, int port, const PadState* state) {
+    if (state == nullptr) return;
+    PadInputState input{};
+    input.buttons = state->buttons;
+    for (std::size_t i = 0; i < input.sticks.size(); ++i) input.sticks[i] = state->sticks[i];
+    input.analogButtonsL2 = state->l2;
+    input.analogButtonsR2 = state->r2;
+    for (std::size_t i = 0; i < input.touch.size(); ++i) {
+        input.touch[i].active = state->touch[i].active != 0;
+        input.touch[i].x = state->touch[i].x;
+        input.touch[i].y = state->touch[i].y;
+        input.touch[i].id = state->touch[i].id;
+    }
+    PadPublishInputForPort_nid_postfix(port, input);
+}
+
+const HostCallbacks g_callbacks{sizeof(HostCallbacks), KytyGpuAbiVersion, nullptr, Log, AddGpuEvent, DeleteGpuEvent, DeliverEvent, nullptr, nullptr, DonateGuestRange, PublishPad};
 
 float g_reportedToneMapPeak = 0.0f;
 

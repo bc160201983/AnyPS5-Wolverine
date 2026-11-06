@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 
 namespace AgcDriver::DriverDetail {
@@ -229,24 +230,63 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
             std::optional<SampledReadScope> sampling;
+            const bool rebase = rebasedStageReuse();
+            std::array<std::uint64_t, static_cast<std::size_t>(StageRebase::Count)> rebaseOutcomes{};
+            std::uint64_t rebaseEqual = 0, rebaseData = 0, rebaseDiffering = 0;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> rebaseLive;
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack || programs[i].userData.size() != dataEntry->decode->programs[i].userData.size()) continue;
                 const auto& now = programs[i].userData;
-                const auto& was = dataEntry->decode->programs[i].userData;
                 auto& candidates = dataCandidates[i];
                 for (const auto& variant : dataEntry->stages[i]) {
+                    const auto& was = rebase && variant->userWords.size() == now.size() ? variant->userWords : dataEntry->decode->programs[i].userData;
                     bool usedEqual = true;
+                    std::uint64_t changed = 0;
                     for (std::size_t w = 0; w < now.size() && usedEqual; ++w) {
-                        if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
+                        if (now[w] == was[w] || (w < 64u && ((variant->userDataMask >> w) & 1u) == 0)) continue;
+                        if (rebase && w < 64u) changed |= std::uint64_t {1} << w;
+                        else usedEqual = false;
                     }
                     if (!usedEqual) continue;
                     if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
+                    if (changed != 0) {
+                        auto outcome = StageRebase::NotPointer;
+                        auto rebased = rebasedVariant(*variant, now, changed, outcome);
+                        ++rebaseOutcomes[static_cast<std::size_t>(outcome)];
+                        if (rebased == nullptr) continue;
+                        appendEntryRegions(*rebased, regions);
+                        auto* live = drawStageDataHits() ? &rebaseLive : nullptr;
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *rebased, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *rebased, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (result == EntryOutcome::EqualData) {
+                            for (const auto& [position, value] : rebaseLive) rebased->words[position] = value;
+                            rebased->compiled = patchDataWords(*rebased, rebased->words);
+                            regions.clear();
+                            appendEntryRegions(*rebased, regions);
+                            ++rebaseData;
+                        } else if (result == EntryOutcome::Equal) {
+                            ++rebaseEqual;
+                        } else {
+                            ++rebaseDiffering;
+                            continue;
+                        }
+                        candidates.emplace_back(std::move(rebased), std::move(regions));
+                        continue;
+                    }
                     appendEntryRegions(*variant, regions);
                     auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
                     if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
                 }
+            }
+            if (rebase) {
+                std::lock_guard cacheLock(drawCacheMutex);
+                auto& counters = drawEntryCounters;
+                for (std::size_t k = 0; k < rebaseOutcomes.size(); ++k) counters.rebase[k] += rebaseOutcomes[k];
+                counters.rebaseEqual += rebaseEqual;
+                counters.rebaseData += rebaseData;
+                counters.rebaseDiffering += rebaseDiffering;
             }
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);

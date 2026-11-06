@@ -36,6 +36,11 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
         text += line;
         std::snprintf(line, sizeof(line), "[draw-cache] register-key miss component changes (10 s): stable registers %llu, user data %llu, auxiliary registers %llu, device %llu, first shader set %llu, unchanged components %llu\n", count(counters.registerKeyMissChanges[0]), count(counters.registerKeyMissChanges[1]), count(counters.registerKeyMissChanges[2]), count(counters.registerKeyMissChanges[3]), count(counters.registerKeyMissChanges[4]), count(counters.registerKeyMissChanges[5]));
         text += line;
+        if (rebasedStageReuse()) {
+            const auto rebase = [&](StageRebase reason) { return count(counters.rebase[static_cast<std::size_t>(reason)]); };
+            std::snprintf(line, sizeof(line), "[draw-cache] rebased stages (10 s): %llu rebased (%llu equal, %llu with refreshed data words, %llu differing), refused: no user words %llu, not a pointer %llu, vertex fetch word %llu, unsafe result %llu\n", rebase(StageRebase::Rebased), count(counters.rebaseEqual), count(counters.rebaseData), count(counters.rebaseDiffering), rebase(StageRebase::NoUserWords), rebase(StageRebase::NotPointer), rebase(StageRebase::FetchWord), rebase(StageRebase::UnsafeResult));
+            text += line;
+        }
     }
     if (profile) text += profileDrawCacheLines(counters);
     AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());

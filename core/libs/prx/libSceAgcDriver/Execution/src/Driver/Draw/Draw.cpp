@@ -882,7 +882,19 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::vector<std::uint32_t> words;
         freshRuns(i, runs, words);
         const auto& compiled = *stageCaptures[i].compiled;
-        const char* what = runs != kept.runs ? "runs" : words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : nullptr;
+        const auto flatten = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, const std::vector<std::uint32_t>& values) {
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
+            std::size_t word = 0;
+            for (const auto& [begin, end] : spans) {
+                for (auto address = begin; address < end && word < values.size(); address += sizeof(std::uint32_t)) flat.emplace_back(address, values[word++]);
+            }
+            std::sort(flat.begin(), flat.end());
+            flat.erase(std::unique(flat.begin(), flat.end()), flat.end());
+            return flat;
+        };
+        const bool sameReads = runs == kept.runs ? words == kept.words : flatten(runs, words) == flatten(kept.runs, kept.words);
+        const bool sameBindings = compiled.bindings.size() == kept.compiled->bindings.size() && std::equal(compiled.bindings.begin(), compiled.bindings.end(), kept.compiled->bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; });
+        const char* what = !sameReads ? "reads" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : !sameBindings ? "bindings" : nullptr;
         ++dataVerified;
         if (what == nullptr) return;
         char message[320];

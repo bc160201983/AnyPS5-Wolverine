@@ -56,8 +56,9 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
     return hash;
 }
 
-void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied) {
-    std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
+void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied, bool rebasable) {
+    const bool relocating = eligible && drawRelocationEnabled();
+    std::uint64_t relocatable = relocating || rebasable ? use.asBase & ~use.asValue : 0;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
     const auto covered = [&](std::uint64_t address) {
@@ -83,7 +84,8 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
         if (found == reads.end() || found->first != address || found->second < 0) return -1;
         return (relocatable >> found->second & 1u) != 0 ? static_cast<std::int8_t>(found->second) : std::int8_t {-1};
     };
-    variant.relocatableWords = relocatable;
+    variant.relocatableWords = relocating ? relocatable : 0;
+    variant.rebasableWords = rebasable ? relocatable : 0;
     for (std::size_t index = 0; index < regions.size(); ++index) {
         const auto& region = regions[index];
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
@@ -107,6 +109,84 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
             current = next;
         }
     }
+}
+
+bool Driver::rebasedStageReuse() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_REBASED_STAGE_REUSE");
+        return text != nullptr && text[0] != 0 && text[0] != '0';
+    }();
+    return enabled;
+}
+
+std::shared_ptr<DispatchVariant> Driver::rebasedVariant(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::uint64_t changed, StageRebase& outcome) {
+    if (variant.compiled == nullptr || variant.userWords.size() != userData.size()) {
+        outcome = StageRebase::NoUserWords;
+        return nullptr;
+    }
+    if (changed == 0 || (changed & ~variant.rebasableWords) != 0 || variant.runBases.size() != variant.runs.size()) {
+        outcome = StageRebase::NotPointer;
+        return nullptr;
+    }
+    if (variant.vertexInfo != nullptr) {
+        for (const auto reg : {static_cast<std::uint32_t>(variant.vertexInfo->fetchAttribReg), static_cast<std::uint32_t>(variant.vertexInfo->fetchBufferReg)}) {
+            const auto fetch = reg + 1u < 64u ? std::uint64_t {3} << reg : ~std::uint64_t {0};
+            if ((changed & fetch) != 0) {
+                outcome = StageRebase::FetchWord;
+                return nullptr;
+            }
+        }
+    }
+    const auto& compiled = *variant.compiled;
+    if (compiled.bdaWrites || !compiled.imageTableRanges.empty() || !compiled.imageTableReadRanges.empty() || !variant.shaderDataPatches.empty()) {
+        outcome = StageRebase::UnsafeResult;
+        return nullptr;
+    }
+    auto copy = std::make_shared<DispatchVariant>();
+    copy->runs = variant.runs;
+    copy->runBases = variant.runBases;
+    copy->relocatableWords = variant.relocatableWords;
+    copy->rebasableWords = variant.rebasableWords;
+    copy->words = variant.words;
+    copy->forgetSerial = variant.forgetSerial;
+    copy->compiled = variant.compiled;
+    copy->meshIndexDescriptor = variant.meshIndexDescriptor;
+    copy->shader = variant.shader;
+    copy->dataPositions = variant.dataPositions;
+    copy->dataSlots = variant.dataSlots;
+    copy->flatBinding = variant.flatBinding;
+    copy->pushOffset = variant.pushOffset;
+    copy->userDataMask = variant.userDataMask;
+    copy->vertexInfo = variant.vertexInfo;
+    copy->userWords.assign(userData.begin(), userData.end());
+    for (auto rest = changed; rest != 0; rest &= rest - 1) {
+        const auto index = static_cast<std::uint32_t>(std::countr_zero(rest));
+        const auto from = variant.userWords[index];
+        const auto to = userData[index];
+        if (from == 0 || to == 0 || ((from ^ to) & 3u) != 0) {
+            outcome = StageRebase::NotPointer;
+            return nullptr;
+        }
+        const auto delta = AlignedWord(to) - AlignedWord(from);
+        bool moved = false;
+        for (std::size_t run = 0; run < copy->runs.size(); ++run) {
+            if (copy->runBases[run] != static_cast<std::int8_t>(index)) continue;
+            copy->runs[run].first += delta;
+            copy->runs[run].second += delta;
+            moved = true;
+        }
+        if (!moved) {
+            outcome = StageRebase::NotPointer;
+            return nullptr;
+        }
+        const auto& forwarded = compiled.shaderDataUserWords;
+        for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+            if (forwarded[slot] == index) copy->shaderDataPatches.emplace_back(slot, to);
+        }
+    }
+    applyShaderDataPatches(*copy);
+    outcome = StageRebase::Rebased;
+    return copy;
 }
 
 namespace {

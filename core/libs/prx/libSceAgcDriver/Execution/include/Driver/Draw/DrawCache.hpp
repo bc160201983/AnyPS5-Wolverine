@@ -88,6 +88,8 @@ struct StageDataHit {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };
 
+enum class StageRebase : std::size_t { Rebased, NoUserWords, NotPointer, FetchWord, UnsafeResult, Count };
+
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
 struct DrawEntryCounters {
@@ -103,6 +105,8 @@ struct DrawEntryCounters {
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(StageRebase::Count)> rebase{};
+    std::uint64_t rebaseEqual = 0, rebaseData = 0, rebaseDiffering = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

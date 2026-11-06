@@ -97,7 +97,7 @@ public:
     [[nodiscard]] std::array<std::uint64_t, 4> PrebuiltLibraries();
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
-    static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied = {});
+    static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied = {}, bool rebasable = false);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix = {});
     static void reportSkip(const char* kind, const std::string& what);
     DrawEntryCounters DrawCacheCounters();
@@ -189,6 +189,8 @@ private:
     void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
+    static bool rebasedStageReuse();
+    static std::shared_ptr<DispatchVariant> rebasedVariant(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::uint64_t changed, StageRebase& outcome);
     static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable);
     static void applyShaderDataPatches(DispatchVariant& variant);
     void learnPendingRelocation();

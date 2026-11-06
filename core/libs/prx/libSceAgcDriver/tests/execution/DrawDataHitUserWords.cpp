@@ -258,6 +258,57 @@ void DirectBufferBaseMovesWithItsPayload() {
     Require(after.dataStagesCompiled - before.dataStagesCompiled >= 1, "a draw whose descriptor base moved reused the pixel stage built for the old base: the rebuild this test documents is gone, flip it to a reuse check (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
+void MovedTableReusesTheStage(bool verify, bool rebased) {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    auto* data = GuestBlock();
+    std::array<std::uint32_t*, 4> tables{GuestBlock(), GuestBlock(), GuestBlock(), GuestBlock()};
+    const auto describe = [](std::uint32_t* table, const std::uint32_t* payload) {
+        const auto address = reinterpret_cast<std::uintptr_t>(payload);
+        table[0] = static_cast<std::uint32_t>(address);
+        table[1] = static_cast<std::uint32_t>(address >> 32u) & 0xffffu;
+        table[2] = 16;
+        table[3] = 0x3004bfacu;
+    };
+    data[0] = std::bit_cast<std::uint32_t>(1.0f);
+    data[64] = std::bit_cast<std::uint32_t>(0.5f);
+    describe(tables[0], data);
+    describe(tables[1], data);
+    describe(tables[2], data + 64);
+    describe(tables[3], data);
+    const auto draw = [&](const std::uint32_t* table, bool setup) {
+        ColorMemory.fill(std::byte{0});
+        auto commands = setup ? Setup(true, PixelCode.data()) : std::vector<std::uint32_t>{};
+        PixelUserData(commands, table, 0x11);
+        Append(commands, 0x2d, {3, 2});
+        Submit(std::move(commands));
+        return BrightestColorByte();
+    };
+    const auto closeTo = [](unsigned value, unsigned expected) { return value + 2 >= expected && value <= expected + 2; };
+    draw(tables[0], true);
+    const auto taught = draw(tables[0], false);
+    Require(closeTo(taught, 255), "a pixel stage loading 1.0 through its table wrote " + std::to_string(taught));
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto moved = draw(tables[1], false);
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto reused = after.dataStagesReused - before.dataStagesReused;
+    const auto compiled = after.dataStagesCompiled - before.dataStagesCompiled;
+    const auto rebases = after.rebase[static_cast<std::size_t>(AgcDriver::DriverDetail::StageRebase::Rebased)] - before.rebase[static_cast<std::size_t>(AgcDriver::DriverDetail::StageRebase::Rebased)];
+    Require(after.dataHits == before.dataHits + 1, "a draw whose table pointer moved to identical contents was not a data-only hit: " + Counts(after));
+    Require(closeTo(moved, 255), "a draw whose table pointer moved to identical contents wrote " + std::to_string(moved) + ", expected 255 (" + Counts(after) + ")");
+    if (verify) Require(compiled == 2 && after.dataVerified - before.dataVerified == (rebased ? 2u : 1u), "verify mode: a draw whose table moved did not build and compare its candidate stages: " + Counts(after));
+    else if (rebased) Require(reused == 2 && compiled == 0 && rebases == 1 && after.rebaseEqual - before.rebaseEqual == 1, "a draw whose table pointer moved to identical contents did not reuse the rebased pixel stage: " + Counts(after) + ", " + std::to_string(rebases) + " rebased");
+    else Require(compiled == 1 && rebases == 0, "without rebased reuse, a draw whose table pointer moved did not compile its pixel stage: " + Counts(after));
+    const auto other = draw(tables[2], false);
+    const auto last = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(closeTo(other, 128), "a draw whose moved table names other data wrote " + std::to_string(other) + ", expected 128 (" + Counts(last) + ")");
+    Require(last.dataStagesCompiled - after.dataStagesCompiled >= 1, "a draw whose moved table names other data reused the pixel stage: " + Counts(last));
+    if (rebased && !verify) Require(last.rebaseDiffering != after.rebaseDiffering, "a rebased stage whose table names other data was not refused by its contents: " + Counts(last));
+    data[0] = std::bit_cast<std::uint32_t>(0.25f);
+    const auto changed = draw(tables[3], false);
+    Require(closeTo(changed, 64), "a draw through a moved table whose payload changed in place wrote " + std::to_string(changed) + ", expected 64");
+}
+
 }
 
 int main() {
@@ -273,6 +324,7 @@ int main() {
         UnreadUserWordsKeepTheStage(verify);
         ReadUserWordsChangeTheOutput();
         DirectBufferBaseMovesWithItsPayload();
+        MovedTableReusesTheStage(verify, std::getenv("APS5_REBASED_STAGE_REUSE") != nullptr);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Data-only hits " << (verify ? "verified" : "reused") << " the stages whose read user words did not change\n";
         return 0;

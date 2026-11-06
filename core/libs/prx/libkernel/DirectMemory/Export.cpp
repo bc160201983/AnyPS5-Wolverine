@@ -2,10 +2,13 @@
 #include "prx/libc/include/Api.hpp"
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
@@ -222,9 +225,51 @@ void ReleaseFlexibleMappingRange(std::uintptr_t address, size_t len) {
     _releaseFlexible(address, len);
 }
 
+namespace {
+
+bool KytyGpuEngine() {
+    static const bool enabled = [] {
+        const char* engine = std::getenv("APS5_GPU_ENGINE");
+        return engine != nullptr && std::strcmp(engine, "kyty") == 0;
+    }();
+    return enabled;
+}
+
+template <typename Function>
+Function KytyGpuExport(const char* nid) {
+#ifdef _WIN32
+    HMODULE module = GetModuleHandleA("kyty_gpu.dll");
+    if (module == nullptr) module = LoadLibraryA("kyty_gpu.dll");
+    if (module == nullptr) throw std::runtime_error("APS5_GPU_ENGINE=kyty: kyty_gpu.dll is not loadable");
+    const auto function = GetProcAddress(module, nid);
+    if (function == nullptr) throw std::runtime_error(std::string("APS5_GPU_ENGINE=kyty: kyty_gpu.dll does not export ") + nid);
+    return reinterpret_cast<Function>(reinterpret_cast<void*>(function));
+#else
+    throw std::runtime_error(std::string("APS5_GPU_ENGINE=kyty is Windows only: ") + nid);
+#endif
+}
+
+void KytyGpuTrace(const char* call, const void* requested, const void* result, std::uint64_t length, int flags, int status) {
+    static const bool enabled = std::getenv("APS5_GPU_ENGINE_TRACE") != nullptr;
+    if (!enabled) return;
+    std::fprintf(stderr, "[gpu-engine] %s requested %p len 0x%llx flags 0x%x -> %d at %p\n", call, requested, static_cast<unsigned long long>(length), flags, status, result);
+}
+
+bool KytyGpuOwns(const void* address, std::size_t bytes) {
+    return KytyGpuEngine() && GuestArena::GuestArenaDonated_nid_postfix(address, bytes == 0 ? 1 : bytes);
+}
+
+}
+
 extern "C" {
 
 int APS5_VABI sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment, int memory_type, int64_t* phys_addr_out) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(int64_t, int64_t, size_t, size_t, int, int64_t*)>("rTXw65xmLIA");
+  const int status = kyty(search_start, search_end, len, alignment, memory_type, phys_addr_out);
+  KytyGpuTrace("AllocateDirectMemory", reinterpret_cast<const void*>(search_start), phys_addr_out != nullptr ? reinterpret_cast<const void*>(*phys_addr_out) : nullptr, len, memory_type, status);
+  return status;
+ }
  if (search_start < 0 || search_end <= search_start || len == 0
   || (len & (PS5_PAGE_SIZE - 1)) || !phys_addr_out
   || (alignment != 0 && (alignment & (PS5_PAGE_SIZE - 1))))
@@ -233,6 +278,10 @@ int APS5_VABI sceKernelAllocateDirectMemory(int64_t search_start, int64_t search
 }
 
 int APS5_VABI sceKernelAllocateMainDirectMemory(size_t len, size_t alignment, int memory_type, int64_t* phys_addr_out) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(size_t, size_t, int, int64_t*)>("B+vc2AO2Zrc");
+  return kyty(len, alignment, memory_type, phys_addr_out);
+ }
  return sceKernelAllocateDirectMemory(0, static_cast<int64_t>(DIRECT_MEMORY_SIZE), len, alignment, memory_type, phys_addr_out);
 }
 
@@ -247,6 +296,10 @@ int APS5_VABI sceKernelAvailableDirectMemorySize(int64_t search_start, int64_t s
 }
 
 int APS5_VABI sceKernelDirectMemoryQuery(int64_t offset, int flags, void* info, size_t info_size) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(int64_t, int, void*, size_t)>("BHouLQzh0X0");
+  return kyty(offset, flags, info, info_size);
+ }
  constexpr int SCE_KERNEL_DMQ_FIND_NEXT = 1;
  if (!info || offset < 0) return SCE_KERNEL_ERROR_EINVAL;
  struct DirectMemoryQueryInfo { int64_t start; int64_t end; int memory_type; };
@@ -269,6 +322,10 @@ int APS5_VABI sceKernelGetDirectMemoryType(int64_t offset, int* memory_type, int
 }
 
 size_t APS5_VABI sceKernelGetDirectMemorySize(void) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<size_t (APS5_VABI*)()>("pO96TwzOm5E");
+  return kyty();
+ }
  return DIRECT_MEMORY_SIZE;
 }
 
@@ -277,6 +334,13 @@ int APS5_VABI sceKernelEnableDmemAliasing(void) {
 }
 
 int APS5_VABI sceKernelMapDirectMemory(void** addr, size_t len, int prot, int flags, int64_t direct_memory_start, size_t alignment) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(void**, size_t, int, int, int64_t, size_t)>("L-Q3LEjIbgA");
+  const void* requested = addr != nullptr ? *addr : nullptr;
+  const int status = kyty(addr, len, prot, flags, direct_memory_start, alignment);
+  KytyGpuTrace("MapDirectMemory", requested, addr != nullptr ? *addr : nullptr, len, flags, status);
+  return status;
+ }
  if (UndefinedProtection(prot)) return SCE_KERNEL_ERROR_EINVAL;
  (void)alignment;
  const int result = DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
@@ -285,6 +349,13 @@ int APS5_VABI sceKernelMapDirectMemory(void** addr, size_t len, int prot, int fl
 }
 
 int APS5_VABI sceKernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags, int64_t direct_memory_start, size_t alignment) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(void**, size_t, int, int, int, int64_t, size_t)>("BQQniolj9tQ");
+  const void* requested = addr != nullptr ? *addr : nullptr;
+  const int status = kyty(addr, len, type, prot, flags, direct_memory_start, alignment);
+  KytyGpuTrace("MapDirectMemory2", requested, addr != nullptr ? *addr : nullptr, len, flags, status);
+  return status;
+ }
  if (UndefinedProtection(prot)) return SCE_KERNEL_ERROR_EINVAL;
  (void)type;
  const int result = DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
@@ -293,12 +364,29 @@ int APS5_VABI sceKernelMapDirectMemory2(void** addr, size_t len, int type, int p
 }
 
 int APS5_VABI sceKernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(void**, size_t, int, int)>("4h6F1LLbTiw");
+  const void* requested = addr_in_out != nullptr ? *addr_in_out : nullptr;
+  const int status = kyty(addr_in_out, len, prot, flags);
+  KytyGpuTrace("MapFlexibleMemory", requested, addr_in_out != nullptr ? *addr_in_out : nullptr, len, flags, status);
+  return status;
+ }
  if (UndefinedProtection(prot)) return SCE_KERNEL_ERROR_EINVAL;
  constexpr int IgnoredHeapFlag = 0x8000;
- return _mapFlexible(addr_in_out, len, prot, flags & ~IgnoredHeapFlag);
+ const void* requested = addr_in_out != nullptr ? *addr_in_out : nullptr;
+ const int status = _mapFlexible(addr_in_out, len, prot, flags & ~IgnoredHeapFlag);
+ KytyGpuTrace("MapFlexibleMemory (AnyPS5)", requested, addr_in_out != nullptr ? *addr_in_out : nullptr, len, flags, status);
+ return status;
 }
 
 int APS5_VABI sceKernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags, int64_t direct_memory_start, size_t alignment, const char* name) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(void**, size_t, int, int, int64_t, size_t, const char*)>("NcaWUxfMNIQ");
+  const void* requested = addr != nullptr ? *addr : nullptr;
+  const int status = kyty(addr, len, prot, flags, direct_memory_start, alignment, name);
+  KytyGpuTrace("MapNamedDirectMemory", requested, addr != nullptr ? *addr : nullptr, len, flags, status);
+  return status;
+ }
  if (UndefinedProtection(prot)) return SCE_KERNEL_ERROR_EINVAL;
  const int result = DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
  if (result == 0) _releaseFlexible(reinterpret_cast<uintptr_t>(*addr), len);
@@ -307,6 +395,13 @@ int APS5_VABI sceKernelMapNamedDirectMemory(void** addr, size_t len, int prot, i
 }
 
 int32_t APS5_VABI sceKernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags, const char* name) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int32_t (APS5_VABI*)(void**, size_t, int, int, const char*)>("mL8NDH86iQI");
+  const void* requested = addr_in_out != nullptr ? *addr_in_out : nullptr;
+  const int32_t status = kyty(addr_in_out, len, prot, flags, name);
+  KytyGpuTrace("MapNamedFlexibleMemory", requested, addr_in_out != nullptr ? *addr_in_out : nullptr, len, flags, status);
+  return status;
+ }
  if (UndefinedProtection(prot)) return SCE_KERNEL_ERROR_EINVAL;
  const int result = _mapFlexible(addr_in_out, len, prot, flags);
  if (result == 0 && name) sceKernelSetVirtualRangeName(*addr_in_out, len, name);
@@ -319,12 +414,20 @@ int32_t APS5_VABI sceKernelMapNamedFlexibleMemoryInternal(void** addr_in_out, si
 }
 
 int APS5_VABI sceKernelMprotect(const void* addr, size_t len, int prot) {
+ if (KytyGpuOwns(addr, len)) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(const void*, size_t, int)>("vSMAm3cxYTY");
+  return kyty(addr, len, prot);
+ }
  constexpr int DefinedProtection = 0x3F7;
  if (len == 0) return 0;
  return DoMprotect(addr, len, prot & DefinedProtection);
 }
 
 int APS5_VABI sceKernelMunmap(uint64_t vaddr, size_t len) {
+ if (KytyGpuOwns(reinterpret_cast<const void*>(vaddr), len)) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(uint64_t, size_t)>("cQke9UuBQOk");
+  return kyty(vaddr, len);
+ }
  const int result = DoMunmap(reinterpret_cast<void*>(vaddr), len);
  if (result == 0) {
   _releaseFlexible(static_cast<uintptr_t>(vaddr), len);
@@ -349,6 +452,10 @@ int APS5_VABI sceKernelReleaseFlexibleMemory(void* addr, size_t len) {
 }
 
 int APS5_VABI sceKernelReleaseDirectMemory(int64_t start, size_t len) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(int64_t, size_t)>("MBuItvba6z8");
+  return kyty(start, len);
+ }
  if (start < 0 || len == 0) return SCE_KERNEL_ERROR_EINVAL;
  if ((static_cast<std::uint64_t>(start) & (PS5_PAGE_SIZE - 1)) != 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 ||
      len > DIRECT_MEMORY_SIZE || static_cast<std::uint64_t>(start) > DIRECT_MEMORY_SIZE - len)
@@ -365,6 +472,10 @@ int APS5_VABI sceKernelReserveVirtualRange(void** addr, size_t len, int flags, s
 }
 
 int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info, uint64_t info_size) {
+ if (KytyGpuOwns(addr, 1)) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(const void*, int, VirtualQueryInfo*, uint64_t)>("rVjRvHJ0X6c");
+  return kyty(addr, flags, info, info_size);
+ }
  if (!info || info_size < sizeof(VirtualQueryInfo)) return SCE_KERNEL_ERROR_EINVAL;
  memset(info, 0, sizeof(VirtualQueryInfo));
  const auto address = reinterpret_cast<uintptr_t>(addr);
@@ -499,6 +610,10 @@ int APS5_VABI sceKernelIsStack(void* addr, void** start, void** end) {
 }
 
 int APS5_VABI sceKernelAvailableFlexibleMemorySize(size_t* size) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(size_t*)>("aNz11fnnzi4");
+  return kyty(size);
+ }
  if (!size) return SCE_KERNEL_ERROR_EINVAL;
  const size_t configured = _configuredFlexibleSize();
  const size_t images = GuestImageSegmentBytes_nid_no_patch();
@@ -508,6 +623,10 @@ int APS5_VABI sceKernelAvailableFlexibleMemorySize(size_t* size) {
 }
 
 int APS5_VABI sceKernelConfiguredFlexibleMemorySize(size_t* size) {
+ if (KytyGpuEngine()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(size_t*)>("n1-v6FgU7MQ");
+  return kyty(size);
+ }
  if (!size) return SCE_KERNEL_ERROR_EINVAL;
  *size = _configuredFlexibleSize();
  return 0;
@@ -519,6 +638,10 @@ int APS5_VABI sceKernelInternalMemoryGetAvailableSize(std::size_t* size) {
 }
 
 int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name) {
+ if (KytyGpuOwns(addr, len)) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(const void*, uint64_t, const char*)>("DGMG3JshrZU");
+  return kyty(addr, len, name);
+ }
  const auto start = reinterpret_cast<uintptr_t>(addr);
  if (!addr || len == 0 || !name || len > UINTPTR_MAX - start) return SCE_KERNEL_ERROR_EINVAL;
  std::lock_guard lock(g_rangeNameLock);
@@ -528,6 +651,10 @@ int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const
 }
 
 int APS5_VABI sceKernelClearVirtualRangeName(const void* addr, uint64_t len) {
+ if (KytyGpuOwns(addr, len)) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(const void*, uint64_t)>("mkgXxsoxWHg");
+  return kyty(addr, len);
+ }
  const auto start = reinterpret_cast<uintptr_t>(addr);
  if (!addr || len == 0 || len > UINTPTR_MAX - start) return SCE_KERNEL_ERROR_EINVAL;
  std::lock_guard lock(g_rangeNameLock);

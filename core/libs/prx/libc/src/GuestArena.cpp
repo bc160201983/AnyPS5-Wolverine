@@ -148,6 +148,75 @@ public:
         _used.emplace(start, start + bytes);
     }
 
+    std::uintptr_t Donate(std::size_t bytes, std::size_t alignment) {
+        if (_base == 0) throw std::runtime_error("guest address space arena is unavailable");
+        if (bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) throw std::invalid_argument("invalid guest arena donation");
+        std::lock_guard lock(_lock);
+        auto limit = _end;
+        std::uintptr_t candidate = 0;
+        while (limit >= _base && bytes <= limit - _base) {
+            const auto start = (limit - bytes) & ~(alignment - 1);
+            if (start < _base) break;
+            const auto next = _used.lower_bound(start + bytes);
+            if (next == _used.begin() || std::prev(next)->second <= start) {
+                candidate = start;
+                break;
+            }
+            limit = std::prev(next)->first;
+        }
+        if (candidate == 0) return 0;
+#ifdef _WIN32
+        const auto address = reinterpret_cast<void*>(candidate);
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(address, &info, sizeof(info)) == 0 || info.State != MEM_RESERVE) return 0;
+        const auto placeholderStart = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+        const auto placeholderEnd = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (candidate + bytes > placeholderEnd) return 0;
+        if ((placeholderStart != candidate || placeholderEnd != candidate + bytes) && !VirtualFree(address, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return 0;
+#endif
+        _used.emplace(candidate, candidate + bytes);
+        _holes.emplace_back(candidate, candidate + bytes);
+        _donated.emplace_back(candidate, bytes);
+        return candidate;
+    }
+
+    std::uintptr_t DonateAt(std::uintptr_t address, std::size_t bytes) {
+        if (_base == 0) throw std::runtime_error("guest address space arena is unavailable");
+        if (bytes == 0 || address < _base || bytes > _end - address) throw std::invalid_argument("invalid guest arena donation");
+        std::lock_guard lock(_lock);
+#ifdef _WIN32
+        for (std::uintptr_t cursor = address; cursor < address + bytes;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_RESERVE) return 0;
+            cursor = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+        for (std::uintptr_t cursor = address; cursor < address + bytes;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) return 0;
+            const auto regionStart = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+            const auto regionEnd = std::min(address + bytes, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
+            const auto pieceStart = std::max(cursor, regionStart);
+            const auto pieceBytes = regionEnd - pieceStart;
+            const auto placeholderEnd = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+            if ((regionStart != pieceStart || placeholderEnd != regionEnd) && !VirtualFree(reinterpret_cast<void*>(pieceStart), pieceBytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return 0;
+            cursor = regionEnd;
+        }
+#endif
+        const auto next = _used.lower_bound(address);
+        if (next == _used.end() || next->first != address) _used.emplace(address, address + bytes);
+        _holes.emplace_back(address, address + bytes);
+        _donated.emplace_back(address, bytes);
+        return address;
+    }
+
+    bool Donated(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(_lock);
+        for (const auto& [base, size] : _donated) {
+            if (address >= base && bytes <= size && address - base <= size - bytes) return true;
+        }
+        return false;
+    }
+
     void Release(const void* pointer, std::size_t bytes) {
         std::lock_guard lock(_lock);
         const auto start = reinterpret_cast<std::uintptr_t>(pointer);
@@ -338,6 +407,7 @@ private:
 
     std::uintptr_t _base = 0;
     std::uintptr_t _end = 0;
+    std::vector<std::pair<std::uintptr_t, std::size_t>> _donated;
     bool _writeWatched = false;
 
 public:
@@ -390,6 +460,18 @@ void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
 
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
     Arena::Get().Release(pointer, bytes);
+}
+
+std::uintptr_t GuestArenaDonate_nid_postfix(std::size_t bytes, std::size_t alignment) {
+    return Arena::Get().Donate(bytes, alignment);
+}
+
+std::uintptr_t GuestArenaDonateAt_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    return Arena::Get().DonateAt(address, bytes);
+}
+
+bool GuestArenaDonated_nid_postfix(const void* pointer, std::size_t bytes) {
+    return Arena::Get().Donated(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaRange_nid_postfix(std::uintptr_t* base, std::size_t* bytes) {

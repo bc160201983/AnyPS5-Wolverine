@@ -38,6 +38,8 @@ struct PadTriggerRequest {
     std::uint8_t effect[11]{};
     std::uint8_t fallback = 0;
     std::uint32_t mode = 0;
+    bool hasCommand = false;
+    std::uint8_t command[56]{};
 };
 
 struct PadOutputState {
@@ -67,6 +69,7 @@ void SetLightBar(int port, bool valid, std::uint8_t r, std::uint8_t g, std::uint
 void SetLightBar(bool valid, std::uint8_t r, std::uint8_t g, std::uint8_t b);
 void SetTriggerCommand(int port, int trigger, const std::uint8_t* command);
 void SetTriggerCommand(int trigger, const std::uint8_t* command);
+void GetTriggerEffectState(int port, std::int32_t* states);
 void ResetOrientation(int port = 0);
 void SetMotionEnabled(int port, bool enabled);
 void SetMotionEnabled(bool enabled);

@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <mutex>
 #include <vector>
 #include "SceTypes.hpp"
@@ -14,7 +15,7 @@
 
 namespace {
 
-constexpr std::uint32_t KytyGpuAbiVersion = (1u << 16u) | 3u;
+constexpr std::uint32_t KytyGpuAbiVersion = (1u << 16u) | 4u;
 
 struct PadTouch {
     std::uint16_t x;
@@ -35,6 +36,21 @@ struct PadState {
 };
 
 static_assert(sizeof(PadState) == 28);
+
+struct PadOutput {
+    std::uint32_t sequence;
+    std::uint8_t vibrationLarge;
+    std::uint8_t vibrationSmall;
+    std::uint8_t audioVibrationLarge;
+    std::uint8_t audioVibrationSmall;
+    std::uint8_t lightBarValid;
+    std::uint8_t lightBar[3];
+    std::uint8_t triggerSet[2];
+    std::uint8_t reserved[2];
+    std::uint8_t triggerCommand[2][56];
+};
+
+static_assert(sizeof(PadOutput) == 128);
 constexpr std::uint32_t EventEopInterrupt = 1;
 constexpr std::uint32_t EventFlip = 2;
 constexpr std::int16_t FilterGraphicsCore = -14;
@@ -56,9 +72,10 @@ struct HostCallbacks {
     int (*donateGuestRange)(void* user, std::uint64_t size, std::uint64_t* base);
     void (*publishPad)(void* user, int port, const PadState* state);
     void (*requestExit)(void* user, int code);
+    int (*fetchPadOutput)(void* user, int port, std::uint32_t* seen, PadOutput* out);
 };
 
-static_assert(sizeof(HostCallbacks) == 88);
+static_assert(sizeof(HostCallbacks) == 96);
 
 struct Registration {
     KernelEqueue eq;
@@ -174,7 +191,26 @@ void RequestExit(void*, int code) {
     LibcRequestExit_nid_postfix(code);
 }
 
-const HostCallbacks g_callbacks{sizeof(HostCallbacks), KytyGpuAbiVersion, nullptr, Log, AddGpuEvent, DeleteGpuEvent, DeliverEvent, nullptr, nullptr, DonateGuestRange, PublishPad, RequestExit};
+int FetchPadOutput(void*, int port, std::uint32_t* seen, PadOutput* out) {
+    if (seen == nullptr || out == nullptr) return -1;
+    PadOutputState state{};
+    if (!PadFetchOutputForPort_nid_postfix(port, seen, &state)) return 0;
+    *out = PadOutput{};
+    out->sequence = state.sequence;
+    out->vibrationLarge = state.vibrationLarge;
+    out->vibrationSmall = state.vibrationSmall;
+    out->audioVibrationLarge = state.audioVibrationLarge;
+    out->audioVibrationSmall = state.audioVibrationSmall;
+    out->lightBarValid = state.lightBarValid ? 1 : 0;
+    std::copy(std::begin(state.lightBar), std::end(state.lightBar), out->lightBar);
+    for (int trigger = 0; trigger < 2; ++trigger) {
+        out->triggerSet[trigger] = state.trigger[trigger].hasCommand ? 1 : 0;
+        std::copy(std::begin(state.trigger[trigger].command), std::end(state.trigger[trigger].command), out->triggerCommand[trigger]);
+    }
+    return 1;
+}
+
+const HostCallbacks g_callbacks{sizeof(HostCallbacks), KytyGpuAbiVersion, nullptr, Log, AddGpuEvent, DeleteGpuEvent, DeliverEvent, nullptr, nullptr, DonateGuestRange, PublishPad, RequestExit, FetchPadOutput};
 
 float g_reportedToneMapPeak = 0.0f;
 

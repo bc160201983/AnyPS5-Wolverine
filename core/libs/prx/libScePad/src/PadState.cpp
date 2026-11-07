@@ -409,6 +409,8 @@ void Pad::SetTriggerCommand(int port, int trigger, const std::uint8_t* command) 
     }
     req.valid = req.effect[0] != 0x05;
     if (!req.valid) req.fallback = 0;
+    req.hasCommand = true;
+    std::memcpy(req.command, command, sizeof(req.command));
     std::lock_guard lock(stateMutex);
     auto& output = slots[port].output;
     output.trigger[trigger] = req;
@@ -418,6 +420,47 @@ void Pad::SetTriggerCommand(int port, int trigger, const std::uint8_t* command) 
 
 void Pad::SetTriggerCommand(int trigger, const std::uint8_t* command) {
     SetTriggerCommand(0, trigger, command);
+}
+
+namespace {
+
+constexpr int TriggerPressedMin = 8;
+
+std::int32_t TriggerState(const std::uint8_t* command, int travel) {
+    std::uint32_t mode = 0;
+    std::memcpy(&mode, command, 4);
+    const std::uint8_t* data = command + 8;
+    const int pos = std::clamp(travel, 0, 255) * 10 / 256;
+    const bool pressed = travel >= TriggerPressedMin;
+    switch (mode) {
+        case 1: return pressed && data[1] != 0 && pos >= data[0] ? 2 : 1;
+        case 2: return pos >= data[1] ? 5 : pos >= data[0] ? 4 : 3;
+        case 3: return pressed && data[1] != 0 && data[2] != 0 && pos >= data[0] ? 7 : 6;
+        case 4: return pressed && data[pos] != 0 ? 2 : 1;
+        case 5: return pressed && pos >= data[0] ? 2 : 1;
+        case 6: return pressed && data[0] != 0 && data[1 + pos] != 0 ? 7 : 6;
+        default: return 0;
+    }
+}
+
+int TriggerTravel(const PadInputState& state, int trigger) {
+    const std::uint8_t analog = trigger == 0 ? state.analogButtonsL2 : state.analogButtonsR2;
+    const std::uint32_t button = trigger == 0 ? 0x100u : 0x200u;
+    return analog == 0 && (state.buttons & button) != 0 ? 255 : analog;
+}
+
+}
+
+void Pad::GetTriggerEffectState(int port, std::int32_t* states) {
+    states[0] = 0;
+    states[1] = 0;
+    if (port < 0 || port >= PAD_MAX_CONTROLLERS) return;
+    std::lock_guard lock(stateMutex);
+    const auto& slot = slots[port];
+    for (int trigger = 0; trigger < 2; ++trigger) {
+        const auto& request = slot.output.trigger[trigger];
+        if (request.hasCommand) states[trigger] = TriggerState(request.command, TriggerTravel(slot.state, trigger));
+    }
 }
 
 void Pad::ResetOrientation(int port) {

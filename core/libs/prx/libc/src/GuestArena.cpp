@@ -55,6 +55,8 @@ constexpr std::uintptr_t ArenaStart = GuestArenaOffset == 0 ? 0x10000ull : Defau
 constexpr std::uintptr_t SystemReservedStart = 0x00000007FFFFC000ull + GuestArenaOffset;
 constexpr std::uintptr_t SystemReservedEnd = 0x0000001000000000ull + GuestArenaOffset;
 constexpr std::uintptr_t ApplicationAreaEnd = 0x000000FC00000000ull + GuestArenaOffset;
+constexpr std::uintptr_t CudaWindowStart = 0x000000DC00000000ull + GuestArenaOffset;
+constexpr std::uintptr_t CudaWindowEnd = 0x000000EC00000000ull + GuestArenaOffset;
 
 std::uintptr_t alignUp(std::uintptr_t value, std::size_t alignment) {
     return (value + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
@@ -250,10 +252,17 @@ private:
         const std::uintptr_t granularity = system.dwAllocationGranularity;
         const std::uintptr_t end = ApplicationAreaEnd;
         std::uint32_t retries = 0;
+        const bool cudaWindow = std::getenv("ASTROHYBRID_CUDA_HOLE") != nullptr;
         for (std::uintptr_t cursor = ArenaStart; cursor < end;) {
+            if (cudaWindow && cursor >= CudaWindowStart && cursor < CudaWindowEnd) {
+                _holes.emplace_back(cursor, CudaWindowEnd);
+                cursor = CudaWindowEnd;
+                continue;
+            }
             MEMORY_BASIC_INFORMATION info{};
             if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "query the guest arena range");
-            const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
+            auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
+            if (cudaWindow && cursor < CudaWindowStart && regionEnd > CudaWindowStart) regionEnd = CudaWindowStart;
             const auto first = info.State == MEM_FREE ? std::min(regionEnd, alignUp(cursor, granularity)) : regionEnd;
             const auto last = std::max(first, regionEnd & ~(granularity - 1));
             if (first < last && WindowsMappings::Get().Reserve(reinterpret_cast<void*>(first), last - first) == nullptr) {

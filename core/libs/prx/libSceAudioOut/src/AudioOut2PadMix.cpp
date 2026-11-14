@@ -5,6 +5,9 @@
 #include <cstring>
 #include <cmath>
 #include <stdexcept>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 AudioOut2Route AudioOut2RouteForPort(std::uint16_t type, std::uint32_t channels) {
     if (type == AUDIO_OUT2_PORT_TYPE_PAD_SPEAKER && (channels == 1 || channels == 2)) return AudioOut2Route::PadSpeaker;
@@ -70,4 +73,29 @@ void AudioOut2WritePadFrames(const float* pad, const AudioOut2PadLayout& layout,
             out[static_cast<std::size_t>(frame) * layout.channels + layout.position[channel]] = pad[static_cast<std::size_t>(frame) * AUDIO_OUT2_PAD_CHANNELS + channel];
         }
     }
+}
+
+std::uint64_t AudioOut2QueueHostPadAudio(std::uint32_t freq, bool speaker, const void* data, std::uint32_t frames, std::uint32_t channels, bool isFloat, float gain) {
+#ifdef _WIN32
+    using Fn = std::uint64_t (*)(std::uint32_t, int, const void*, std::uint32_t, std::uint32_t, int, float);
+    static Fn cached = nullptr;
+    Fn fn = cached;
+    if (fn == nullptr) {
+        HMODULE mod = GetModuleHandleA("kyty_gpu.dll");
+        if (mod == nullptr) return 0;
+        fn = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(mod, "KytyGpuQueuePadAudio")));
+        if (fn == nullptr) return 0;
+        cached = fn;
+    }
+    return fn(freq, speaker ? 1 : 0, data, frames, channels, isFloat ? 1 : 0, gain);
+#else
+    (void)freq;
+    (void)speaker;
+    (void)data;
+    (void)frames;
+    (void)channels;
+    (void)isFloat;
+    (void)gain;
+    return 0;
+#endif
 }

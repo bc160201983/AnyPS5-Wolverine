@@ -332,6 +332,39 @@ static void paceVirtualPort(Port& port, bool hasData, std::unique_lock<std::mute
     port.virtualQueueEnd += (1000000ULL * port.samplesNum) / port.freq;
 }
 
+static bool tryOutputHostPadPort(Port& port, const void* data, std::unique_lock<std::mutex>& lock) {
+    if ((port.type != PORT_TYPE_PADSPK && port.type != PORT_TYPE_VIBRATION) || port.channels <= 0 || port.channels > 2 || data == nullptr) {
+        return false;
+    }
+    const auto frames = port.samplesNum;
+    const auto ch = static_cast<std::uint32_t>(port.channels);
+    std::vector<float> scaled(static_cast<std::size_t>(frames) * ch);
+    if (formatIsFloat(port.format)) {
+        const auto* src = static_cast<const float*>(data);
+        for (std::uint32_t fr = 0; fr < frames; ++fr) {
+            for (std::uint32_t c = 0; c < ch; ++c) {
+                scaled[fr * ch + c] = src[fr * ch + c] *
+                    (static_cast<float>(port.volume[c]) / static_cast<float>(DEFAULT_VOLUME));
+            }
+        }
+    } else {
+        const auto* src = static_cast<const std::int16_t*>(data);
+        for (std::uint32_t fr = 0; fr < frames; ++fr) {
+            for (std::uint32_t c = 0; c < ch; ++c) {
+                scaled[fr * ch + c] = (static_cast<float>(src[fr * ch + c]) / 32768.0f) *
+                    (static_cast<float>(port.volume[c]) / static_cast<float>(DEFAULT_VOLUME));
+            }
+        }
+    }
+    const auto queuedUs = AudioOut2QueueHostPadAudio(
+        port.freq, port.type == PORT_TYPE_PADSPK, scaled.data(), frames, ch, true, 1.0f);
+    if (queuedUs == 0) {
+        return false;
+    }
+    paceVirtualPort(port, true, lock);
+    return true;
+}
+
 static void outputVirtualPort(Port& port, const void* data, std::unique_lock<std::mutex>& lock) {
     const auto pad = port.type == PORT_TYPE_VIBRATION && data != nullptr ? prepareVibration(port, data) : std::vector<float>{};
     paceVirtualPort(port, data != nullptr, lock);
@@ -485,7 +518,9 @@ int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) try {
         return -2144993277;
     }
 
-    if (port->device == 0) {
+    if (tryOutputHostPadPort(*port, ptr, lock)) {
+        // Routed to DualSense Bluetooth/USB speaker or haptics via kyty_gpu.dll.
+    } else if (port->device == 0) {
         outputVirtualPort(*port, ptr, lock);
     } else {
         queueAudio(*port, ptr, lock);
@@ -522,7 +557,9 @@ int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num) 
     Port& first = *getPort(param[0].handle);
     for (std::uint32_t i = 0; i < num; i++) {
         Port& port = *getPort(param[i].handle);
-        if (port.device == 0) {
+        if (tryOutputHostPadPort(port, param[i].ptr, lock)) {
+            // Routed to DualSense Bluetooth/USB speaker or haptics via kyty_gpu.dll.
+        } else if (port.device == 0) {
             outputVirtualPort(port, param[i].ptr, lock);
         } else {
             queueAudio(port, param[i].ptr, lock);

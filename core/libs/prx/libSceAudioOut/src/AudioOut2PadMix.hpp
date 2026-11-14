@@ -32,5 +32,6 @@ void AudioOut2FinishPadMix(float* out, std::uint32_t frames);
 std::array<std::uint8_t, 2> AudioOut2RumbleFromPadFrames(const float* pad, std::uint32_t frames);
 AudioOut2PadLayout AudioOut2PadLayoutForDriver(const char* driver);
 void AudioOut2WritePadFrames(const float* pad, const AudioOut2PadLayout& layout, float* out, std::uint32_t frames);
+std::uint64_t AudioOut2QueueHostPadAudio(std::uint32_t freq, bool speaker, const void* data, std::uint32_t frames, std::uint32_t channels, bool isFloat, float gain = 1.0f);
 
 #endif

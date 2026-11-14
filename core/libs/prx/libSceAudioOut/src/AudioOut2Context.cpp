@@ -226,6 +226,29 @@ static void Render(AudioOut2Context& context, const AudioOut2Grain& grain) {
     }
     std::fill(context.mix.begin(), context.mix.end(), 0.0f);
     AudioOut2MixPorts(context, grain, context.mix.data(), pad, context.grain);
+    std::uint64_t vibrationQueuedUs = 0;
+    if (pad != nullptr && context.padDevice == 0) {
+        std::vector<float> speakerStereo(static_cast<std::size_t>(context.grain) * 2);
+        std::vector<float> vibrationStereo(static_cast<std::size_t>(context.grain) * 2);
+        for (std::uint32_t frame = 0; frame < context.grain; ++frame) {
+            const float* src = pad + static_cast<std::size_t>(frame) * AUDIO_OUT2_PAD_CHANNELS;
+            speakerStereo[frame * 2 + 0] = std::clamp(src[AUDIO_OUT2_PAD_SPEAKER_LEFT], -1.0f, 1.0f);
+            speakerStereo[frame * 2 + 1] = std::clamp(src[AUDIO_OUT2_PAD_SPEAKER_RIGHT], -1.0f, 1.0f);
+            vibrationStereo[frame * 2 + 0] = std::clamp(src[AUDIO_OUT2_PAD_VIBRATION_LEFT], -1.0f, 1.0f);
+            vibrationStereo[frame * 2 + 1] = std::clamp(src[AUDIO_OUT2_PAD_VIBRATION_RIGHT], -1.0f, 1.0f);
+        }
+        const auto speakerQueuedUs = AudioOut2QueueHostPadAudio(
+            AUDIO_OUT2_SAMPLE_RATE, true, speakerStereo.data(), context.grain, 2, true, 1.0f);
+        vibrationQueuedUs = AudioOut2QueueHostPadAudio(
+            AUDIO_OUT2_SAMPLE_RATE, false, vibrationStereo.data(), context.grain, 2, true, 1.0f);
+        if (speakerQueuedUs == 0) {
+            for (std::uint32_t frame = 0; frame < context.grain; ++frame) {
+                const float* src = pad + static_cast<std::size_t>(frame) * AUDIO_OUT2_PAD_CHANNELS;
+                context.mix[frame * 2 + 0] += src[AUDIO_OUT2_PAD_SPEAKER_LEFT];
+                context.mix[frame * 2 + 1] += src[AUDIO_OUT2_PAD_SPEAKER_RIGHT];
+            }
+        }
+    }
     for (float& sample : context.mix) {
         sample = std::clamp(sample * MASTER_GAIN, -1.0f, 1.0f);
         if (AudioOut2TraceEnabled()) context.summaryPeak = std::max(context.summaryPeak, std::abs(sample));
@@ -233,7 +256,7 @@ static void Render(AudioOut2Context& context, const AudioOut2Grain& grain) {
     if (pad != nullptr) {
         AudioOut2FinishPadMix(pad, context.grain);
         if (context.padDevice != 0) QueuePadGrain(context);
-        else {
+        else if (vibrationQueuedUs == 0) {
             const auto rumble = AudioOut2RumbleFromPadFrames(pad, context.grain);
             PadSubmitAudioHaptics_nid_postfix(rumble[0], rumble[1]);
         }

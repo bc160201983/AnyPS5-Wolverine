@@ -882,9 +882,24 @@ int APS5_VABI sceSaveDataTerminate(void) {
 }
 
 static int transferringMount(const SaveDataTransferringMount* mount, SaveDataMountResult* mount_result) {
-    (void)mount;
     if (mount_result != nullptr) {
         std::memset(mount_result, 0, sizeof(*mount_result));
+    }
+    SAVEDATA_TRACE("transferringMount user=%d title=%s dir=%s", mount != nullptr ? mount->user_id : -1,
+                   mount != nullptr && mount->title_id != nullptr ? mount->title_id->data : "(null)",
+                   mount != nullptr && mount->dir_name != nullptr ? mount->dir_name->data : "(null)");
+    // Some older Astro Bot builds use the transfer entry point as their first
+    // normal-save mount. Keep the SDK's default (NOT_FOUND) semantics, but
+    // allow the hybrid runtime to opt into the compatible fallback.
+    const char* transfer_fallback = std::getenv("APS5_SAVEDATA_TRANSFER_FALLBACK");
+    if (transfer_fallback != nullptr && std::strcmp(transfer_fallback, "0") != 0 &&
+        mount != nullptr &&
+        mount->dir_name != nullptr && mount_result != nullptr) {
+        SaveDataMount3 regular{};
+        regular.user_id   = mount->user_id;
+        regular.dir_name  = mount->dir_name;
+        regular.mount_mode = SAVE_DATA_MOUNT_MODE_CREATE2 | SAVE_DATA_MOUNT_MODE_RDWR;
+        return mount3(&regular, mount_result);
     }
     // No PS4-to-PS5 transfer data exists on this console.
     return SAVE_DATA_ERROR_NOT_FOUND;

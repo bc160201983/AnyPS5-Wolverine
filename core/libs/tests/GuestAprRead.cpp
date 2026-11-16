@@ -2,8 +2,12 @@
 #include "prx/libc/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
+#include "SceTypes.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +18,8 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 
 namespace {
@@ -52,14 +58,18 @@ public:
         std::filesystem::remove(FilePath, ignored);
     }
 
-    void Read(void* destination, std::uint64_t bytes, std::uint64_t offset) const {
-        const Apr::ReadFileCommand command{{Apr::Opcode::ReadFile, sizeof(Apr::ReadFileCommand)}, id, 0,
+    void Read(void* destination, std::uint64_t bytes, std::uint64_t offset) const { ReadFile(id, destination, bytes, offset); }
+
+    static void ReadFile(std::uint32_t fileId, void* destination, std::uint64_t bytes, std::uint64_t offset) {
+        const Apr::ReadFileCommand command{{Apr::Opcode::ReadFile, sizeof(Apr::ReadFileCommand)}, fileId, 0,
             reinterpret_cast<std::uint64_t>(destination), bytes, offset};
         alignas(8) std::array<std::uint8_t, sizeof(command)> memory{};
         std::memcpy(memory.data(), &command, sizeof(command));
         Apr::CommandBufferObject buffer{Apr::BufferType::Generic, 0, sizeof(memory), 1, sizeof(memory), memory.data()};
         Require(sceKernelAprSubmitCommandBuffer(&buffer, 0) == 0, "APR read submission failed");
     }
+
+    std::uint32_t Id() const { return id; }
 
 private:
     std::uint32_t id = 0;
@@ -114,6 +124,47 @@ void TestEof(const Fixture& fixture) {
     CheckRead(fixture, data, 65537, FileBytes);
     CheckRead(fixture, data, 65537, FileBytes + 19);
 }
+
+#ifdef _WIN32
+void TestLongEof() {
+    constexpr std::size_t payloadBytes = 100;
+    std::vector<std::filesystem::path> directories{std::filesystem::current_path() / "apr_long"};
+    while (directories.back().native().size() < MAX_PATH + 16) directories.push_back(directories.back() / std::wstring(40, L'a'));
+    const auto extended = [](const std::filesystem::path& path) { return L"\\\\?\\" + path.wstring(); };
+    for (const auto& directory : directories) Require(CreateDirectoryW(extended(directory).c_str(), nullptr) != 0, "cannot create the long directory");
+    const auto file = directories.back() / L"payload.bin";
+    const HANDLE handle = CreateFileW(extended(file).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    Require(handle != INVALID_HANDLE_VALUE, "cannot create the long path file");
+    std::array<std::uint8_t, payloadBytes> payload{};
+    for (std::size_t index = 0; index < payload.size(); ++index) payload[index] = FileByte(index);
+    DWORD written = 0;
+    const bool wrote = WriteFile(handle, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr) != 0 && written == payload.size();
+    CloseHandle(handle);
+    std::array<std::uint8_t, 2 * payloadBytes + 2> storage{};
+    storage.fill(0xCC);
+    const auto text = file.string();
+    const char* path = text.c_str();
+    std::uint32_t id = 0;
+    std::uint32_t failed = 0;
+    const bool resolved = sceKernelAprResolveFilepathsToIds(&path, 1, &id, &failed) == 0 && failed == 0;
+    std::string error;
+    try {
+        if (resolved) Fixture::ReadFile(id, storage.data() + 1, 2 * payloadBytes, 0);
+    } catch (const std::exception& caught) {
+        error = caught.what();
+    }
+    DeleteFileW(extended(file).c_str());
+    for (auto it = directories.rbegin(); it != directories.rend(); ++it) RemoveDirectoryW(extended(*it).c_str());
+    Require(wrote, "cannot write the long path file");
+    Require(resolved, "cannot resolve the long path APR file");
+    Require(error.empty(), "APR read of the long path file failed");
+    Require(storage.front() == 0xCC && storage.back() == 0xCC, "APR wrote outside the requested range");
+    for (std::size_t index = 0; index < 2 * payloadBytes; ++index) {
+        const auto expected = index < payloadBytes ? FileByte(index) : std::uint8_t{0};
+        Require(storage[index + 1] == expected, "APR returned incorrect bytes or did not zero-fill the end of a long path file");
+    }
+}
+#endif
 
 void TestErrors(const Fixture& fixture) {
     std::array<std::uint8_t, 8> data;
@@ -176,6 +227,7 @@ void TestStreams(const Fixture& fixture) {
 void TestQueries() {
     constexpr int GuestEinval = 22;
     constexpr int GuestEnoent = 2;
+    constexpr int GuestEfault = 14;
     const char* names[] = {"generated.bin", "missing.bin"};
     std::array<std::uint32_t, 2> ids{0, 0};
     std::array<std::uint64_t, 2> sizes{1, 1};
@@ -187,12 +239,46 @@ void TestQueries() {
     sizes = {1, 1};
     Require(sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes("apr_read_", names, 2, ids.data(), sizes.data(), &failed) == -1 && *__error_nid_postfix() == GuestEnoent, "APR resolved a missing prefixed path");
     Require(failed == 1 && ids[0] == id && sizes[0] == FileBytes && ids[1] == 0xFFFFFFFFu && sizes[1] == 0, "APR did not mark only the missing prefixed path");
+    Require(sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes("apr_read_", names, 1, reinterpret_cast<std::uint32_t*>(0x10), sizes.data(), &failed) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unwritable prefixed id array");
+    Require(sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes("apr_read_", names, 1, ids.data(), reinterpret_cast<std::uint64_t*>(0x10), &failed) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unwritable prefixed size array");
+    Require(sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes("apr_read_", names, 2, ids.data(), sizes.data(), reinterpret_cast<std::uint32_t*>(0x10)) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unwritable prefixed error index");
+    const char* paths[] = {"apr_read_generated.bin", "apr_read_missing.bin"};
+    ids = {0, 0};
+    sizes = {1, 1};
+    failed = 7;
+    Require(sceKernelAprResolveFilepathsToIdsAndFileSizes(paths, 2, ids.data(), sizes.data(), &failed) == -1 && *__error_nid_postfix() == GuestEnoent, "APR resolved a missing path");
+    Require(failed == 1 && ids[0] == id && sizes[0] == FileBytes && ids[1] == 0xFFFFFFFFu && sizes[1] == 0, "APR did not mark only the missing path");
+    Require(sceKernelAprResolveFilepathsToIdsAndFileSizes(paths, 1, reinterpret_cast<std::uint32_t*>(0x10), sizes.data(), &failed) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unwritable id array");
+    Require(sceKernelAprResolveFilepathsToIdsAndFileSizes(paths, 1, ids.data(), reinterpret_cast<std::uint64_t*>(0x10), &failed) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unwritable size array");
+    Require(sceKernelAprResolveFilepathsToIdsAndFileSizes(paths, 2, ids.data(), sizes.data(), reinterpret_cast<std::uint32_t*>(0x10)) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unwritable error index");
     std::uint64_t size = 0;
     Require(sceKernelAprGetFileSize(id, nullptr) == -1 && *__error_nid_postfix() == GuestEinval, "APR accepted a null file size");
     Require(sceKernelAprGetFileSize(id, &size) == 0 && size == FileBytes, "APR reported a wrong file size");
     FileStat stat{};
     Require(sceKernelAprGetFileStat(id, nullptr) == -1 && *__error_nid_postfix() == GuestEinval, "APR accepted a null file stat");
     Require(sceKernelAprGetFileStat(id, &stat) == 0 && stat.st_size == static_cast<std::int64_t>(FileBytes), "APR reported a wrong file stat size");
+    for (const bool readable : {true, false}) {
+#ifdef _WIN32
+        void* page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, readable ? PAGE_READONLY : PAGE_NOACCESS);
+        Require(page != nullptr, "cannot map an unwritable APR destination");
+#else
+        void* page = mmap(nullptr, 4096, readable ? PROT_READ : PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        Require(page != MAP_FAILED, "cannot map an unwritable APR destination");
+#endif
+        *__error_nid_postfix() = 0;
+        Require(sceKernelAprGetFileSize(id, static_cast<std::uint64_t*>(page)) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unwritable file size");
+        *__error_nid_postfix() = 0;
+        Require(sceKernelAprGetFileStat(id, static_cast<FileStat*>(page)) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unwritable file stat");
+        if (readable) {
+            const auto* bytes = static_cast<const std::uint8_t*>(page);
+            Require(std::all_of(bytes, bytes + 4096, [](std::uint8_t byte) { return byte == 0; }), "APR wrote into an unwritable destination");
+        }
+#ifdef _WIN32
+        VirtualFree(page, 0, MEM_RELEASE);
+#else
+        munmap(page, 4096);
+#endif
+    }
     std::vector<std::uint8_t> data(4096, 0xCC);
     const Apr::ReadFileCommand command{{Apr::Opcode::ReadFile, sizeof(Apr::ReadFileCommand)}, id, 0, reinterpret_cast<std::uint64_t>(data.data()), data.size(), 100};
     alignas(8) std::array<std::uint8_t, sizeof(command)> memory{};
@@ -204,12 +290,239 @@ void TestQueries() {
     Require(sceKernelAprSubmitCommandBufferAndGetResult(nullptr, 0, &result, &first) == -1 && *__error_nid_postfix() == GuestEinval, "APR accepted a null command buffer");
     Require(sceKernelAprSubmitCommandBufferAndGetResult(&buffer, 0, &result, nullptr) == -1 && *__error_nid_postfix() == GuestEinval, "APR accepted a null submission id");
     Require(result == 0xFFFFFFFFu && first == 0, "a rejected APR submission wrote its result or id");
+    *__error_nid_postfix() = 0;
+    Require(sceKernelAprSubmitCommandBufferAndGetId(reinterpret_cast<const Apr::CommandBufferObject*>(0x10), 0, &first) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted an unreadable command buffer object");
+    Apr::CommandBufferObject unreadable{Apr::BufferType::Generic, 0, sizeof(memory), 1, sizeof(memory), nullptr};
+    *__error_nid_postfix() = 0;
+    Require(sceKernelAprSubmitCommandBufferAndGetId(&unreadable, 0, &first) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted a command buffer with an unreadable base");
+    const Apr::CommandBufferObject oversized{Apr::BufferType::Generic, 0, sizeof(memory) + 1, 1, sizeof(memory), memory.data()};
+    *__error_nid_postfix() = 0;
+    Require(sceKernelAprSubmitCommandBufferAndGetId(&oversized, 0, &first) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted a cursor past the command buffer capacity");
+    Require(sceKernelAprSubmitCommandBuffer(&oversized, 0) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted a cursor past the command buffer capacity without an id");
+    const Apr::CommandBufferObject zero{Apr::BufferType::Generic, 0, 1, 1, 0, memory.data()};
+    *__error_nid_postfix() = 0;
+    Require(sceKernelAprSubmitCommandBufferAndGetId(&zero, 0, &first) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted a cursor past a command buffer without capacity");
+    Require(sceKernelAprSubmitCommandBuffer(&zero, 0) == -1 && *__error_nid_postfix() == GuestEfault, "APR accepted a cursor past a command buffer without capacity without an id");
+    Require(first == 0 && result == 0xFFFFFFFFu, "a rejected APR submission wrote its result or id");
     Require(sceKernelAprSubmitCommandBufferAndGetResult(&buffer, 0, &result, &first) == 0 && result == 0 && first != 0, "APR did not return a result and an id");
     Require(sceKernelAprWaitCommandBuffer(first) == 0, "APR did not wait for the submission");
     for (std::size_t index = 0; index < data.size(); ++index) Require(data[index] == FileByte(100 + index), "APR read through the submission with a result returned incorrect bytes");
     std::uint32_t second = 0;
     Require(sceKernelAprSubmitCommandBufferAndGetResult(&buffer, 1, &result, &second) == 0 && second == first + 1, "APR submission ids did not count up");
     Require(sceKernelAprWaitCommandBuffer(second) == 0, "APR did not wait for the second submission");
+}
+
+// Reads of a file id no resolve returned (KytyPS5 issue #2183: Wolverine reads 0xFFFFFFFF). By default
+// the read fails, the buffer goes on, its event fires and the result buffer gets ENOENT and the failed
+// command's offset; APS5_APR_BAD_FILE_ID=zero also zero-fills the destination, =abort throws as before.
+class CommandWriter {
+public:
+    template<class TCommand>
+    std::uint32_t Add(const TCommand& command) {
+        const auto offset = static_cast<std::uint32_t>(bytes.size());
+        bytes.resize(bytes.size() + sizeof(command));
+        std::memcpy(bytes.data() + offset, &command, sizeof(command));
+        return offset;
+    }
+
+    Apr::CommandBufferObject Buffer() {
+        const auto size = static_cast<std::uint32_t>(bytes.size());
+        return {Apr::BufferType::Generic, 0, size, 1, size, bytes.data()};
+    }
+
+private:
+    std::vector<std::uint8_t> bytes;
+};
+
+Apr::ReadFileCommand ReadCommand(Apr::Opcode opcode, std::uint32_t id, void* destination, std::uint64_t bytes, std::uint64_t offset) {
+    return {{opcode, sizeof(Apr::ReadFileCommand)}, id, 0, reinterpret_cast<std::uint64_t>(destination), bytes, offset};
+}
+
+Apr::WriteKernelEventQueueCommand EventCommand(KernelEqueue eq, std::uint64_t ident, std::uint64_t data) {
+    return {{Apr::Opcode::WriteKernelEventQueue, sizeof(Apr::WriteKernelEventQueueCommand)}, static_cast<std::uint64_t>(eq), ident, data, 0};
+}
+
+Apr::WriteAddressCommand WriteCommand(std::uint64_t* address, std::uint64_t value) {
+    return {{Apr::Opcode::WriteAddress, sizeof(Apr::WriteAddressCommand)}, reinterpret_cast<std::uint64_t>(address), value, 0, 0};
+}
+
+void RequireEvent(KernelEqueue eq, std::uintptr_t ident, std::intptr_t data, const char* message) {
+    KernelEvent event{};
+    int count = 0;
+    const KernelUseconds poll = 0;
+    Require(sceKernelWaitEqueue(eq, &event, 1, &count, &poll) == 0 && count == 1, message);
+    Require(sceKernelGetEventId(&event) == ident && sceKernelGetEventData(&event) == data, message);
+}
+
+void TestUnknownFileIds(std::uint32_t id, bool zeroFill) {
+    constexpr int GuestEnoent = 2;
+    constexpr std::uint32_t Enoent = 0x80020002u;
+    KernelEqueue eq = 0;
+    Require(sceKernelCreateEqueue(&eq, "apr bad id") == 0, "cannot create the APR event queue");
+    Require(sceKernelAddAmprEvent(eq, 9, nullptr) == 0 && sceKernelAddAmprEvent(eq, 10, nullptr) == 0, "cannot add the APR events");
+
+    // Executed on the submitting thread (the queue is idle): an unresolved id, a scatter read that
+    // continues it, a good read, then the event and an address write that must still run.
+    std::array<std::uint8_t, 16> bad;
+    std::array<std::uint8_t, 8> continued;
+    std::vector<std::uint8_t> good(64, 0xCC);
+    bad.fill(0xA5);
+    continued.fill(0xA5);
+    alignas(8) std::uint64_t done = 0;
+    CommandWriter direct;
+    const auto failedAt = direct.Add(ReadCommand(Apr::Opcode::ReadFile, 0xFFFFFFFFu, bad.data(), bad.size(), 0));
+    direct.Add(ReadCommand(Apr::Opcode::ReadFileScatter, 0, continued.data(), continued.size(), 0));
+    direct.Add(ReadCommand(Apr::Opcode::ReadFile, id, good.data(), good.size(), 5));
+    direct.Add(EventCommand(eq, 9, 0x55AA));
+    direct.Add(WriteCommand(&done, 1));
+    auto buffer = direct.Buffer();
+    std::array<std::uint32_t, 2> result{0xAAAAAAAAu, 0xBBBBBBBBu};
+    std::uint32_t submission = 0;
+    Require(sceKernelAprSubmitCommandBufferAndGetResult(&buffer, 0, result.data(), &submission) == 0 && submission != 0, "APR rejected a buffer that reads an unknown file id");
+    Require(sceKernelAprWaitCommandBuffer(submission) == 0, "APR did not complete a buffer that reads an unknown file id");
+    Require(result[0] == Enoent && result[1] == failedAt, "APR did not report ENOENT and the failed command's offset");
+    for (const auto byte : bad) Require(byte == (zeroFill ? 0 : 0xA5), zeroFill ? "the unknown-id read did not zero-fill" : "the unknown-id read modified its destination");
+    for (const auto byte : continued) Require(byte == (zeroFill ? 0 : 0xA5), "the scatter read after an unknown-id read did not fail the same way");
+    for (std::size_t index = 0; index < good.size(); ++index) Require(good[index] == FileByte(5 + index), "the read after an unknown-id read returned incorrect bytes");
+    Require(done == 1, "the command buffer stopped at the unknown-id read");
+    RequireEvent(eq, 9, 0x55AA, "the event after an unknown-id read did not fire");
+
+    // Executed by the queue worker (which aborted the process on an exception): the first buffer
+    // waits until released, so the second, whose read fails after one command, queues behind it.
+    alignas(8) std::uint64_t flag = 0;
+    alignas(8) std::uint64_t marker = 0;
+    std::array<std::uint8_t, 16> late;
+    late.fill(0xA5);
+    CommandWriter waiting;
+    waiting.Add(Apr::WaitCommand{{Apr::Opcode::WaitOnAddress, sizeof(Apr::WaitCommand)}, reinterpret_cast<std::uint64_t>(&flag), 1, ~std::uint64_t{0}, 0, 0, Apr::CounterAccess::Size8, 0});
+    auto waitBuffer = waiting.Buffer();
+    std::uint32_t waitSubmission = 0;
+    Require(sceKernelAprSubmitCommandBufferAndGetId(&waitBuffer, 0, &waitSubmission) == 0, "APR rejected the waiting buffer");
+    CommandWriter queued;
+    queued.Add(WriteCommand(&marker, 7));
+    const auto queuedFailedAt = queued.Add(ReadCommand(Apr::Opcode::ReadFile, 0x01234567u, late.data(), late.size(), 0));
+    queued.Add(EventCommand(eq, 10, 0x77));
+    auto queuedBuffer = queued.Buffer();
+    result = {0xAAAAAAAAu, 0xBBBBBBBBu};
+    Require(sceKernelAprSubmitCommandBufferAndGetResult(&queuedBuffer, 0, result.data(), &submission) == 0 && submission > waitSubmission, "APR rejected the queued buffer");
+    Require(result[0] == 0 && marker == 0, "the queued buffer ran before the wait ahead of it");
+    std::atomic_ref<std::uint64_t>(flag).store(1, std::memory_order_release);
+    Require(sceKernelAprWaitCommandBuffer(submission) == 0, "APR did not complete the queued buffer that reads an unknown file id");
+    Require(result[0] == Enoent && result[1] == queuedFailedAt && marker == 7, "the queue worker did not report the unknown-id read");
+    for (const auto byte : late) Require(byte == (zeroFill ? 0 : 0xA5), "the queued unknown-id read did not honour the policy");
+    RequireEvent(eq, 10, 0x77, "the event after a queued unknown-id read did not fire");
+
+    std::uint64_t size = 5;
+    FileStat stat{};
+    Require(sceKernelAprGetFileSize(0xFFFFFFFFu, &size) == -1 && *__error_nid_postfix() == GuestEnoent && size == 5, "APR reported a size for an unknown file id");
+    Require(sceKernelAprGetFileStat(0xFFFFFFFFu, &stat) == -1 && *__error_nid_postfix() == GuestEnoent, "APR reported a stat for an unknown file id");
+
+    // A good buffer still reports success through the result.
+    CommandWriter clean;
+    clean.Add(ReadCommand(Apr::Opcode::ReadFile, id, good.data(), good.size(), 9));
+    auto cleanBuffer = clean.Buffer();
+    result = {0xAAAAAAAAu, 0xBBBBBBBBu};
+    Require(sceKernelAprSubmitCommandBufferAndGetResult(&cleanBuffer, 0, result.data(), &submission) == 0 && sceKernelAprWaitCommandBuffer(submission) == 0, "APR rejected a good buffer after unknown-id reads");
+    Require(result[0] == 0 && good[0] == FileByte(9), "a good buffer after unknown-id reads did not succeed");
+    Require(sceKernelDeleteAmprEvent(eq, 9) == 0 && sceKernelDeleteAmprEvent(eq, 10) == 0 && sceKernelDeleteEqueue(eq) == 0, "cannot remove the APR event queue");
+}
+
+void TestUnknownFileIdAborts() {
+    std::array<std::uint8_t, 8> data;
+    data.fill(0xA5);
+    CommandWriter writer;
+    writer.Add(ReadCommand(Apr::Opcode::ReadFile, 0xFFFFFFFFu, data.data(), data.size(), 0));
+    auto buffer = writer.Buffer();
+    bool rejected = false;
+    try {
+        sceKernelAprSubmitCommandBuffer(&buffer, 0);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()).find("unknown file id") != std::string::npos;
+    }
+    Require(rejected, "APS5_APR_BAD_FILE_ID=abort did not keep the unknown-id exception");
+    std::uint64_t size = 0;
+    rejected = false;
+    try {
+        sceKernelAprGetFileSize(0xFFFFFFFFu, &size);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    Require(rejected, "APS5_APR_BAD_FILE_ID=abort did not keep the unknown-id size exception");
+template<class TCommand>
+void Append(std::vector<std::uint8_t>& memory, const TCommand& command) {
+    const auto at = memory.size();
+    memory.resize(at + sizeof(command));
+    std::memcpy(memory.data() + at, &command, sizeof(command));
+}
+
+Apr::WaitCommand WaitAtLeast(const std::uint64_t* address, std::uint64_t reference) {
+    Apr::WaitCommand command{};
+    command.header = {Apr::Opcode::WaitOnAddress, sizeof(Apr::WaitCommand)};
+    command.address = reinterpret_cast<std::uint64_t>(address);
+    command.reference = reference;
+    command.mask = ~std::uint64_t{0};
+    command.compare = 4;
+    return command;
+}
+
+Apr::WriteAddressCommand WriteValue(std::uint64_t* address, std::uint64_t value) {
+    return {{Apr::Opcode::WriteAddress, sizeof(Apr::WriteAddressCommand)}, reinterpret_cast<std::uint64_t>(address), value, 0, 0};
+}
+
+std::uint64_t LoadValue(std::uint64_t* address) {
+    return std::atomic_ref<std::uint64_t>(*address).load(std::memory_order_acquire);
+}
+
+void TestPriorities() {
+    alignas(8) static std::uint64_t release = 0;
+    alignas(8) static std::uint64_t waiterDone = 0;
+    alignas(8) static std::uint64_t releaserDone = 0;
+    alignas(8) static std::uint64_t behindDone = 0;
+    std::vector<std::uint8_t> waiter;
+    Append(waiter, WaitAtLeast(&release, 1));
+    Append(waiter, WriteValue(&waiterDone, 1));
+    std::vector<std::uint8_t> behind;
+    Append(behind, WriteValue(&behindDone, 1));
+    std::vector<std::uint8_t> releaser;
+    Append(releaser, WriteValue(&release, 1));
+    Append(releaser, WriteValue(&releaserDone, 1));
+    const auto object = [](std::vector<std::uint8_t>& memory) {
+        return Apr::CommandBufferObject{Apr::BufferType::Generic, 0, static_cast<std::uint32_t>(memory.size()), 2, static_cast<std::uint32_t>(memory.size()), memory.data()};
+    };
+    auto waiterBuffer = object(waiter);
+    auto behindBuffer = object(behind);
+    auto releaserBuffer = object(releaser);
+    std::uint32_t waiterId = 0, behindId = 0, releaserId = 0;
+    Require(sceKernelAprSubmitCommandBufferAndGetId(&waiterBuffer, 5, &waiterId) == 0, "the waiting APR buffer was not submitted");
+    Require(sceKernelAprSubmitCommandBufferAndGetId(&behindBuffer, 5, &behindId) == 0, "the APR buffer behind the wait was not submitted");
+    Require(behindId == waiterId + 1, "APR submission ids did not count up across one priority");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Require(LoadValue(&waiterDone) == 0 && LoadValue(&behindDone) == 0, "an APR buffer ran past an unsatisfied wait of its own priority");
+    Require(sceKernelAprSubmitCommandBufferAndGetId(&releaserBuffer, 1, &releaserId) == 0 && releaserId == behindId + 1, "APR submission ids did not count up across priorities");
+    for (int poll = 0; poll < 5000 && LoadValue(&releaserDone) == 0; ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Require(LoadValue(&releaserDone) == 1, "an APR buffer at another priority stayed behind a waiting buffer");
+    Require(sceKernelAprWaitCommandBuffer(releaserId) == 0 && sceKernelAprWaitCommandBuffer(waiterId) == 0 && sceKernelAprWaitCommandBuffer(behindId) == 0, "APR did not wait for the buffers by id");
+    Require(LoadValue(&waiterDone) == 1 && LoadValue(&behindDone) == 1, "the released APR buffers did not finish in order");
+}
+
+void TestSubmitOrder() {
+    alignas(8) static std::uint64_t idSlot = 0;
+    alignas(8) static std::uint64_t resultSlot = 0;
+    constexpr std::uint64_t written = 0xA5A5A5A5A5A5A5A5ull;
+    std::vector<std::uint8_t> commands;
+    Append(commands, WriteValue(&idSlot, written));
+    Append(commands, WriteValue(&resultSlot, written));
+    Apr::CommandBufferObject buffer{Apr::BufferType::Generic, 0, static_cast<std::uint32_t>(commands.size()), 2, static_cast<std::uint32_t>(commands.size()), commands.data()};
+    auto* id = reinterpret_cast<std::uint32_t*>(&idSlot);
+    auto* result = reinterpret_cast<std::uint32_t*>(&resultSlot);
+    Require(sceKernelAprSubmitCommandBufferAndGetResult(&buffer, 3, result, id) == 0, "the APR buffer that writes its own id and result was not submitted");
+    for (int poll = 0; poll < 5000 && (LoadValue(&idSlot) != written || LoadValue(&resultSlot) != written); ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Require(LoadValue(&idSlot) == written, "APR wrote the submission id after the commands that write the same memory ran");
+    Require(LoadValue(&resultSlot) == written, "APR wrote the submission result after the commands that write the same memory ran");
+    idSlot = 0;
+    Require(sceKernelAprSubmitCommandBufferAndGetId(&buffer, 3, id) == 0, "the APR buffer that writes its own id was not submitted");
+    for (int poll = 0; poll < 5000 && LoadValue(&idSlot) != written; ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Require(LoadValue(&idSlot) == written, "APR wrote the submission id after the commands that write the same memory ran");
 }
 
 #ifdef _WIN32
@@ -308,6 +621,14 @@ int main(int argc, char** argv) {
             TestErrors(fixture);
         } else if (mode == "streams") {
             TestStreams(fixture);
+        } else if (mode == "unknown_id" || mode == "unknown_id_zero") {
+            TestUnknownFileIds(fixture.Id(), mode == "unknown_id_zero");
+        } else if (mode == "unknown_id_abort") {
+            TestUnknownFileIdAborts();
+        } else if (mode == "priorities") {
+            TestPriorities();
+        } else if (mode == "order") {
+            TestSubmitOrder();
 #ifdef _WIN32
         } else if (mode == "fault") {
             const FaultBuffer storage;
@@ -315,6 +636,8 @@ int main(int argc, char** argv) {
             Require(committedPages > 2, "APR did not exercise demand-committed destination pages");
         } else if (mode == "stack") {
             TestSmallStack(fixture);
+        } else if (mode == "longeof") {
+            TestLongEof();
 #endif
         } else {
             throw std::runtime_error("unknown APR read case");

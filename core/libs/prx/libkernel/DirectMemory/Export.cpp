@@ -259,6 +259,19 @@ bool KytyGpuOwns(const void* address, std::size_t bytes) {
     return KytyGpuEngine() && GuestArena::GuestArenaDonated_nid_postfix(address, bytes == 0 ? 1 : bytes);
 }
 
+// APS5_GPU_ENGINE_MEMORY=full (with APS5_GPU_ENGINE=kyty): Kyty also owns the title's virtual
+// reservations, batch maps and direct-memory availability. Titles such as Marvel's Wolverine
+// reserve fixed ranges and fill them with Kyty's direct memory through sceKernelBatchMap; with
+// those calls left here the reservation is AnyPS5's and Kyty cannot map into it. Pair it with
+// KYTY_GPU_APP_RANGE so the application area is Kyty's address space. Off: Astro Bot's split.
+bool KytyGpuOwnsAllMemory() {
+    static const bool enabled = [] {
+        const char* mode = std::getenv("APS5_GPU_ENGINE_MEMORY");
+        return KytyGpuEngine() && mode != nullptr && std::strcmp(mode, "full") == 0;
+    }();
+    return enabled;
+}
+
 }
 
 extern "C" {
@@ -286,6 +299,10 @@ int APS5_VABI sceKernelAllocateMainDirectMemory(size_t len, size_t alignment, in
 }
 
 int APS5_VABI sceKernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end, size_t alignment, int64_t* phys_addr_out, size_t* size_out) {
+ if (KytyGpuOwnsAllMemory()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(int64_t, int64_t, size_t, int64_t*, size_t*)>("C0f7TJcbfac");
+  return kyty(search_start, search_end, alignment, phys_addr_out, size_out);
+ }
  int64_t start = 0;
  size_t size = 0;
  const int result = DirectMemoryLargestFree(search_start, search_end, alignment, &start, &size);
@@ -466,6 +483,13 @@ int APS5_VABI sceKernelReleaseDirectMemory(int64_t start, size_t len) {
 }
 
 int APS5_VABI sceKernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment) {
+ if (KytyGpuOwnsAllMemory()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(void**, size_t, int, size_t)>("7oxv3PPCumo");
+  const void* requested = addr != nullptr ? *addr : nullptr;
+  const int status = kyty(addr, len, flags, alignment);
+  KytyGpuTrace("ReserveVirtualRange", requested, addr != nullptr ? *addr : nullptr, len, flags, status);
+  return status;
+ }
  const int result = DoReserveVirtual(addr, len, flags, alignment);
  if (result == 0) _releaseFlexible(reinterpret_cast<uintptr_t>(*addr), len);
  return result;
@@ -583,6 +607,10 @@ int APS5_VABI sceKernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 }
 
 int APS5_VABI sceKernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
+ if (KytyGpuOwnsAllMemory() && KytyGpuOwns(addr, len)) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(const void*, size_t, int, int)>("9bfdLIyuwCY");
+  return kyty(addr, len, type, prot);
+ }
  if (len == 0) return 0;
  return DoMtypeprotect(addr, len, type, prot);
 }
@@ -698,11 +726,23 @@ int APS5_VABI sceKernelSetPrtAperture(int index, void* addr, size_t len) {
 }
 
 int APS5_VABI sceKernelBatchMap(KernelBatchMapEntry* entries, int num_entries, int* num_entries_out) {
+ if (KytyGpuOwnsAllMemory()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(KernelBatchMapEntry*, int, int*)>("2SKEx6bSq-4");
+  const int status = kyty(entries, num_entries, num_entries_out);
+  KytyGpuTrace("BatchMap", entries != nullptr && num_entries > 0 ? entries[0].start : nullptr, nullptr, static_cast<std::uint64_t>(num_entries), 0x10, status);
+  return status;
+ }
  constexpr int MapFixed = 0x10;
  return sceKernelBatchMap2(entries, num_entries, num_entries_out, MapFixed);
 }
 
 int APS5_VABI sceKernelBatchMap2(KernelBatchMapEntry* entries, int num_entries, int* num_entries_out, int flags) {
+ if (KytyGpuOwnsAllMemory()) {
+  static const auto kyty = KytyGpuExport<int (APS5_VABI*)(KernelBatchMapEntry*, int, int*, int)>("kBJzF8x4SyE");
+  const int status = kyty(entries, num_entries, num_entries_out, flags);
+  KytyGpuTrace("BatchMap2", entries != nullptr && num_entries > 0 ? entries[0].start : nullptr, nullptr, static_cast<std::uint64_t>(num_entries), flags, status);
+  return status;
+ }
  if (!entries || num_entries < 0) return SCE_KERNEL_ERROR_EINVAL;
  constexpr int OpMapDirect = 0;
  constexpr int OpUnmap = 1;

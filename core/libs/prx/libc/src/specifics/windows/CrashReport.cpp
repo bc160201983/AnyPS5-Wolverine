@@ -559,6 +559,15 @@ void ReportThreadContext(const CONTEXT* context, DWORD threadId, const char* nam
     Report("  thread %lu '%s': rip ", static_cast<unsigned long>(threadId), name ? name : "");
     DescribeAddress(context->Rip, line, sizeof(line));
     Report("%s rsp 0x%016llx rbp 0x%016llx\n", line, static_cast<unsigned long long>(context->Rsp), static_cast<unsigned long long>(context->Rbp));
+    // APS5_HANG_DUMP_REGS=1: every thread's general registers too, to see what a thread that spins in
+    // title code (a stall with an idle GPU) is polling.
+    static const bool allRegisters = std::getenv("APS5_HANG_DUMP_REGS") != nullptr;
+    if (allRegisters) {
+        Report("    rax %016llx rbx %016llx rcx %016llx rdx %016llx\n", static_cast<unsigned long long>(context->Rax), static_cast<unsigned long long>(context->Rbx), static_cast<unsigned long long>(context->Rcx), static_cast<unsigned long long>(context->Rdx));
+        Report("    rsi %016llx rdi %016llx r8  %016llx r9  %016llx\n", static_cast<unsigned long long>(context->Rsi), static_cast<unsigned long long>(context->Rdi), static_cast<unsigned long long>(context->R8), static_cast<unsigned long long>(context->R9));
+        Report("    r10 %016llx r11 %016llx r12 %016llx r13 %016llx\n", static_cast<unsigned long long>(context->R10), static_cast<unsigned long long>(context->R11), static_cast<unsigned long long>(context->R12), static_cast<unsigned long long>(context->R13));
+        Report("    r14 %016llx r15 %016llx\n", static_cast<unsigned long long>(context->R14), static_cast<unsigned long long>(context->R15));
+    }
     for (std::size_t depth = 0; depth < frameCount; ++depth) {
         DescribeAddress(frames[depth], line, sizeof(line));
         Report("    #%llu %s\n", static_cast<unsigned long long>(depth), line);

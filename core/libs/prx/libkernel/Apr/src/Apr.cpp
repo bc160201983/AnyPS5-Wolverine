@@ -11,6 +11,7 @@
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/WindowsVerbatimPath.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
 #include "prx/libkernel/Apr/include/AmmPool.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -41,6 +43,7 @@
 namespace {
 
 constexpr int GUEST_ENOENT = 2;
+constexpr int GUEST_EFAULT = 14;
 constexpr int GUEST_EINVAL = 22;
 
 struct AprFile {
@@ -65,6 +68,12 @@ std::string _foldCase(std::string text) {
     return text;
 }
 
+std::filesystem::path _hostPath(const std::filesystem::path& path) {
+    std::error_code error;
+    auto verbatim = NativeVerbatimPath_nid_no_patch(path, error);
+    return error ? path : verbatim;
+}
+
 bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     {
         std::lock_guard lock(g_directoriesLock);
@@ -75,7 +84,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
 #ifdef _WIN32
             // The find data carries each size; std::filesystem would query every entry again.
             WIN32_FIND_DATAW entry{};
-            const HANDLE find = FindFirstFileExW((path.parent_path() / L"*").c_str(), FindExInfoBasic, &entry, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+            const HANDLE find = FindFirstFileExW((_hostPath(path.parent_path()) / L"*").c_str(), FindExInfoBasic, &entry, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
             if (find != INVALID_HANDLE_VALUE) {
                 do {
                     if ((entry.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) continue;
@@ -102,7 +111,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     }
     // Not in the listing (created since, or an unusual name): ask the file system directly.
     std::error_code error;
-    if (!std::filesystem::is_regular_file(path, error)) return false;
+    if (!std::filesystem::is_regular_file(_hostPath(path), error)) return false;
     FileStat stat{};
     File::FillFileStat(path, &stat);
     bytes = static_cast<std::uint64_t>(stat.st_size);
@@ -114,12 +123,20 @@ int _fail(int guestErrno) {
     return -1;
 }
 
+bool _traceApr() {
+    static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
+    return trace;
+}
+
 bool _resolve(const char* guestPath, std::uint32_t* id, std::uint64_t* size) {
     if (!guestPath) return false;
     std::filesystem::path hostPath;
-    if (ResolvePathError_nid_no_patch(guestPath, hostPath) != 0) return false;
     std::uint64_t bytes = 0;
-    if (!_fileSize(hostPath, bytes)) return false;
+    if (ResolvePathError_nid_no_patch(guestPath, hostPath) != 0 || !_fileSize(hostPath, bytes)) {
+        // The caller gets INVALID_FILE_ID for this path; a read of that id is reported below.
+        if (_traceApr()) std::fprintf(stderr, "[apr] resolve failed: %s\n", guestPath);
+        return false;
+    }
     std::lock_guard lock(g_filesLock);
     const auto key = hostPath.string();
     auto found = g_idsByPath.find(key);
@@ -141,6 +158,107 @@ AprFile _file(std::uint32_t id) {
 constexpr std::uint32_t INVALID_FILE_ID = 0xFFFFFFFFu;
 constexpr int SCE_KERNEL_ERROR_ENOENT = static_cast<int>(0x80020002);
 
+// A file id no resolve call returned: INVALID_FILE_ID, which the resolve calls write for a path they
+// cannot find, or a stale or uninitialised id. Wolverine's Loose Load queue reads id 0xFFFFFFFF after
+// the Marvel Games logo (KytyPS5 issue #2183). Throwing here aborted the process (the queue worker
+// turns any exception into std::abort). Such a read now fails with SCE_KERNEL_ERROR_ENOENT (the code
+// the resolve calls give a missing path, and the one KytyPS5 PR #937 reports for this read), which
+// goes to the submission's result buffer with the command's offset, and the rest of the command
+// buffer still runs, so its trailing WriteKernelEventQueue or WriteAddress still signals the queue
+// that waits on it. (KytyPS5 stops the buffer at the failed read, which is the black screen of
+// #2183.) What the console does after a failed command is not documented here; this is the choice
+// that cannot hang a waiter.
+// APS5_APR_BAD_FILE_ID: "fail" (default) fails the read and leaves the destination as it was, "zero"
+// also zero-fills the destination, "abort" restores the exception.
+enum class BadFileIdPolicy { Fail, Zero, Abort };
+
+BadFileIdPolicy _badFileIdPolicy() {
+    static const BadFileIdPolicy policy = [] {
+        const char* value = std::getenv("APS5_APR_BAD_FILE_ID");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "fail") == 0 || std::strcmp(value, "1") == 0) return BadFileIdPolicy::Fail;
+        if (std::strcmp(value, "zero") == 0) return BadFileIdPolicy::Zero;
+        if (std::strcmp(value, "abort") == 0 || std::strcmp(value, "0") == 0) return BadFileIdPolicy::Abort;
+        std::fprintf(stderr, "[apr] APS5_APR_BAD_FILE_ID=%s is not fail, zero or abort; using fail\n", value);
+        return BadFileIdPolicy::Fail;
+    }();
+    return policy;
+}
+
+bool _knownFileId(std::uint32_t id) {
+    std::lock_guard lock(g_filesLock);
+    return id < g_files.size();
+}
+
+// Once per distinct id (every time with APS5_TRACE_APR), so a queue that retries does not flood the log.
+void _reportUnknownFileId(std::uint32_t id, const char* use) {
+    constexpr std::size_t MaxReportedIds = 64;
+    static std::mutex& lock = *new std::mutex();
+    static std::set<std::uint32_t>& reported = *new std::set<std::uint32_t>();
+    bool first = false;
+    bool last = false;
+    std::size_t files = 0;
+    {
+        std::lock_guard guard(lock);
+        if (reported.size() < MaxReportedIds) {
+            first = reported.insert(id).second;
+            last = first && reported.size() == MaxReportedIds;
+        }
+    }
+    if (!first && !_traceApr()) return;
+    {
+        std::lock_guard guard(g_filesLock);
+        files = g_files.size();
+    }
+    std::fprintf(stderr, "[apr] %s of unknown file id 0x%08x failed with 0x%08x (ENOENT; %zu ids resolved)%s\n", use, id,
+        static_cast<unsigned>(SCE_KERNEL_ERROR_ENOENT), files, id == INVALID_FILE_ID ? "; the id is the one a failed resolve writes (APS5_TRACE_APR=1 logs failed resolves)" : "");
+    if (last) std::fprintf(stderr, "[apr] %zu distinct unknown file ids reported; further ones are not logged\n", MaxReportedIds);
+    std::fflush(stderr);
+}
+
+// What a submission reports in its result buffer ({int32 result, uint32 errorOffset}, the layout of
+// AmmSubmitResult too): the first failed command's error and its byte offset in the command buffer.
+struct ExecutionResult {
+    std::int32_t result = 0;
+    std::uint32_t errorOffset = 0;
+    // The guest's result buffer (sceKernelAprSubmitCommandBufferAndGetResult), or null. The first
+    // failure is stored there at once, so it is in place before a later WriteKernelEventQueue or
+    // WriteAddress of the same buffer tells the guest the buffer is done.
+    std::uint32_t* sink = nullptr;
+};
+
+// Stores {result, errorOffset} in the guest's result buffer through GuestCopyOut (the buffer is guest
+// memory, which the submission calls only probe once, at submission).
+void _storeResult(std::uint32_t* sink, const ExecutionResult& status) {
+    if (sink == nullptr) return;
+    const std::uint32_t words[2] = {static_cast<std::uint32_t>(status.result), status.errorOffset};
+    if (!GuestCopyOut_nid_no_patch(sink, words, sizeof(words))) {
+        std::fprintf(stderr, "[apr] the result buffer 0x%llx is not writable guest memory; result 0x%08x not stored\n",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(sink)), static_cast<unsigned>(status.result));
+        std::fflush(stderr);
+    }
+}
+
+// Fails a read of an unknown file id; false under APS5_APR_BAD_FILE_ID=abort (the read then throws).
+bool _failUnknownFileRead(const Apr::ReadFileCommand& command, std::uint32_t commandOffset, ExecutionResult& status) {
+    const auto policy = _badFileIdPolicy();
+    if (policy == BadFileIdPolicy::Abort) return false;
+    if (policy == BadFileIdPolicy::Zero && command.size != 0) {
+        const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
+        if (destination.Open()) std::memset(reinterpret_cast<void*>(command.destination), 0, static_cast<std::size_t>(command.size));
+    }
+    if (status.result == 0) {
+        status.result = SCE_KERNEL_ERROR_ENOENT;
+        status.errorOffset = commandOffset;
+        _storeResult(status.sink, status);
+    }
+    _reportUnknownFileId(command.fileId, "read");
+    if (_traceApr()) {
+        std::fprintf(stderr, "[apr] failed read: id=0x%08x offset=0x%llx size=0x%llx -> 0x%llx (command at 0x%x)\n", command.fileId,
+            static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination), commandOffset);
+    }
+    return true;
+}
+
 int _resolveForEach(const char* prefix, const char** paths, uint32_t count, uint32_t* ids, uint64_t* sizes, int* results) {
     if (!paths || !ids) return _fail(GUEST_EINVAL);
     std::uint32_t resolvedCount = 0;
@@ -159,9 +277,9 @@ int _resolveForEach(const char* prefix, const char** paths, uint32_t count, uint
 
 void _readFile(const Apr::ReadFileCommand& command) {
     const auto file = _file(command.fileId);
-    static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
-    if (trace) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination));
-    std::ifstream stream(file.path, std::ios::binary);
+    if (_traceApr()) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination));
+    const auto hostPath = _hostPath(file.path);
+    std::ifstream stream(hostPath, std::ios::binary);
     if (!stream) throw std::runtime_error("APR: cannot open " + file.path.string());
     stream.seekg(static_cast<std::streamoff>(command.offset));
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
@@ -183,13 +301,32 @@ void _readFile(const Apr::ReadFileCommand& command) {
     if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
     const auto read = static_cast<std::uint64_t>(stream.gcount());
 #endif
-    if (read != command.size && (!stream.eof() || command.offset + read < std::filesystem::file_size(file.path))) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
+    if (read != command.size && (!stream.eof() || command.offset + read < std::filesystem::file_size(hostPath))) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
     if (read != command.size) std::memset(reinterpret_cast<char*>(command.destination) + read, 0, static_cast<std::size_t>(command.size - read));
+}
+
+std::string _addressText(std::uint64_t address) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+    return text;
+}
+
+void _storeGuestAddress(std::uint64_t address, std::uint64_t value) {
+    if (!GuestCopyOut_nid_no_patch(reinterpret_cast<void*>(address), &value, sizeof(value)))
+        throw std::runtime_error("APR: the write address " + _addressText(address) + " is not writable guest memory");
+    std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(address)).store(value, std::memory_order_release);
+}
+
+std::uint64_t _loadGuestAddress(std::uint64_t address) {
+    std::uint64_t value = 0;
+    if (!GuestCopyIn_nid_no_patch(&value, reinterpret_cast<const void*>(address), sizeof(value)))
+        throw std::runtime_error("APR: the wait address " + _addressText(address) + " is not readable guest memory");
+    return value;
 }
 
 void _writeAddress(const Apr::WriteAddressCommand& command) {
     if (command.flags != 0) throw std::runtime_error("APR: WriteAddress flags " + std::to_string(command.flags) + " not implemented");
-    std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).store(command.value, std::memory_order_release);
+    _storeGuestAddress(command.address, command.value);
 }
 
 std::array<std::atomic<std::uint32_t>, 256> g_counters{};
@@ -297,7 +434,73 @@ AmmState& _amm() {
     return state;
 }
 
+int _ammHostProtection(std::int32_t protection);
+
+// APS5_GPU_ENGINE=kyty with APS5_GPU_ENGINE_MEMORY=full: Kyty owns direct memory, reservations and
+// mappings (DirectMemory/Export.cpp), so the AMM range and its pages go through the public calls,
+// which forward to Kyty. The direct memory AMM maps comes from Kyty's sceKernelAllocateDirectMemory;
+// mapped with AnyPS5's own primitives it would be AnyPS5 memory the GPU never sees.
+bool _ammKyty() {
+    static const bool enabled = [] {
+        const char* engine = std::getenv("APS5_GPU_ENGINE");
+        const char* memory = std::getenv("APS5_GPU_ENGINE_MEMORY");
+        return engine != nullptr && std::strcmp(engine, "kyty") == 0 && memory != nullptr && std::strcmp(memory, "full") == 0;
+    }();
+    return enabled;
+}
+
+// PS5 protection for Kyty: CPU and GPU bits kept, AMM's extra read (0x140) / write (0x280) bits folded in.
+int _ammKytyProtection(std::int32_t protection) {
+    int prot = protection & 0x33;
+    if ((protection & 0x140) != 0) prot |= 0x11;
+    if ((protection & 0x280) != 0) prot |= 0x33;
+    if ((prot & 0x02) != 0) prot |= 0x01;
+    if ((prot & 0x20) != 0) prot |= 0x10;
+    return prot;
+}
+
+int _ammProtectionKey(std::int32_t protection) {
+    return _ammKyty() ? _ammKytyProtection(protection) : _ammHostProtection(protection);
+}
+
+int _ammReserveRange(void** address, std::size_t size, int flags, std::size_t alignment) {
+    return _ammKyty() ? sceKernelReserveVirtualRange(address, size, flags, alignment) : DoReserveVirtual(address, size, flags, alignment);
+}
+
+int _ammMapDirectRange(void** address, std::size_t size, std::int32_t protection, std::uint64_t physical) {
+    if (_ammKyty()) return sceKernelMapDirectMemory(address, size, _ammKytyProtection(protection), GuestMapFixed, static_cast<std::int64_t>(physical), 0);
+    return DoMapDirect(address, size, _ammHostProtection(protection), GuestMapFixed, static_cast<std::int64_t>(physical), 0);
+}
+
+int _ammProtectRange(void* address, std::size_t size, std::int32_t protection) {
+    if (_ammKyty()) return sceKernelMprotect(address, size, _ammKytyProtection(protection));
+    return DoMprotect(address, size, _ammHostProtection(protection));
+}
+
+// Unbacked PRT pages read as zero on the GPU.
+int _ammMapZeroRange(void** address, std::size_t size) {
+    constexpr int CpuRead = 0x01;
+    constexpr int GpuRead = 0x10;
+    if (!_ammKyty()) return DoMapAnon(address, size, GpuRead, GuestMapFixed);
+    void* target = *address;
+    int status = sceKernelMapFlexibleMemory(&target, size, CpuRead | GpuRead, GuestMapFixed);
+    if (status != 0) {
+        target = *address;
+        status = sceKernelMapFlexibleMemory(&target, size, CpuRead, GuestMapFixed);
+    }
+    if (status == 0) *address = target;
+    return status;
+}
+
 std::uintptr_t _ammBase(AmmState& state) {
+    if (state.base == 0 && _ammKyty()) {
+        void* address = nullptr;
+        const int status = sceKernelReserveVirtualRange(&address, AmmReservedBytes, 0, AmmRangeAlignment);
+        if (status != 0) throw std::runtime_error("AMM: Kyty cannot reserve the virtual address range (" + std::to_string(status) + ")");
+        state.base = reinterpret_cast<std::uintptr_t>(address);
+        std::fprintf(stderr, "[amm] virtual address range 0x%llx + 0x%llx in Kyty's address space\n",
+            static_cast<unsigned long long>(state.base), static_cast<unsigned long long>(AmmReservedBytes));
+    }
     if (state.base == 0) {
         std::uintptr_t arenaBase = 0;
         std::size_t arenaBytes = 0;
@@ -385,12 +588,12 @@ std::vector<AmmPage> _mappedPages(AmmState& state, std::uint64_t address, std::u
 
 void _reserve(std::uint64_t address, std::uint64_t size) {
     void* target = reinterpret_cast<void*>(address);
-    if (DoReserveVirtual(&target, size, GuestMapFixed, 0) != 0) throw std::runtime_error("AMM: cannot return the range to the reservation");
+    if (_ammReserveRange(&target, size, GuestMapFixed, 0) != 0) throw std::runtime_error("AMM: cannot return the range to the reservation");
 }
 
 void _mapRun(std::uint64_t address, std::uint64_t physical, std::uint64_t size, std::int32_t protection) {
     void* target = reinterpret_cast<void*>(address);
-    if (DoMapDirect(&target, size, _ammHostProtection(protection), GuestMapFixed, static_cast<std::int64_t>(physical), 0) != 0) throw std::runtime_error("AMM: map failed");
+    if (_ammMapDirectRange(&target, size, protection, physical) != 0) throw std::runtime_error("AMM: map failed");
 }
 
 void _mapPages(AmmState& state, std::uint64_t address, const std::vector<AmmPage>& pages) {
@@ -414,9 +617,8 @@ void _requirePrt(AmmState& state, std::uint64_t address, std::uint64_t size) {
 }
 
 void _zeroPrt(std::uint64_t address, std::uint64_t size) {
-    constexpr int GpuRead = 0x10;
     void* target = reinterpret_cast<void*>(address);
-    if (DoMapAnon(&target, size, GpuRead, GuestMapFixed) != 0) throw std::runtime_error("AMM: cannot map the unbacked PRT pages");
+    if (_ammMapZeroRange(&target, size) != 0) throw std::runtime_error("AMM: cannot map the unbacked PRT pages");
 }
 
 void _ammUnmap(const Apr::AmmUnmapCommand& command) {
@@ -463,7 +665,7 @@ void _ammAllocatePrt(const Apr::AmmProtectCommand& command) {
                 entry.type = command.type;
                 entry.protection = command.protection;
             }
-            if (DoMprotect(reinterpret_cast<void*>(address), bytes, _ammHostProtection(command.protection)) != 0) throw std::runtime_error("AMM: protection change failed");
+            if (_ammProtectRange(reinterpret_cast<void*>(address), bytes, command.protection) != 0) throw std::runtime_error("AMM: protection change failed");
         } else {
             try {
                 AmmPool::MapScattered(state, address, bytes, command.type, command.protection, [&](std::uint64_t at, std::uint64_t physical, std::uint64_t size) { _mapRun(at, physical, size, command.protection); });
@@ -536,10 +738,10 @@ void _ammProtect(const Apr::AmmProtectCommand& command, bool type) {
         state.pages[command.address + index * PS5_PAGE_SIZE] = page;
     }
     for (std::size_t first = 0; first < pages.size();) {
-        const int host = _ammHostProtection(pages[first].protection);
+        const int key = _ammProtectionKey(pages[first].protection);
         std::size_t last = first + 1;
-        while (last < pages.size() && _ammHostProtection(pages[last].protection) == host) ++last;
-        if (DoMprotect(reinterpret_cast<void*>(command.address + first * PS5_PAGE_SIZE), (last - first) * PS5_PAGE_SIZE, host) != 0) throw std::runtime_error("AMM: protection change failed");
+        while (last < pages.size() && _ammProtectionKey(pages[last].protection) == key) ++last;
+        if (_ammProtectRange(reinterpret_cast<void*>(command.address + first * PS5_PAGE_SIZE), (last - first) * PS5_PAGE_SIZE, pages[first].protection) != 0) throw std::runtime_error("AMM: protection change failed");
         first = last;
     }
 }
@@ -551,24 +753,31 @@ struct ReadCursor {
     std::uint64_t nextOffset = 0;
 };
 
-void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor& read) {
+void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor& read, std::uint32_t commandOffset, ExecutionResult& status) {
     if (opcode != Apr::Opcode::ReadFile) {
         if (!read.valid) throw std::runtime_error("APR: gather or scatter read without a preceding read");
         command.fileId = read.fileId;
         if (opcode == Apr::Opcode::ReadFileGather) command.destination = read.nextDestination;
         if (opcode == Apr::Opcode::ReadFileScatter) command.offset = read.nextOffset;
     }
-    _readFile(command);
+    // The gather/scatter state advances past a failed read too, so the reads that continue it fail
+    // with the same id instead of losing their place.
+    if (_knownFileId(command.fileId) || !_failUnknownFileRead(command, commandOffset, status)) _readFile(command);
     read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
 }
 
+// Execution state of one submission: where it stopped (at a wait it deferred) and what it reports.
 struct Deferred {
     std::uint32_t cursor = 0;
     ReadCursor read;
+    ExecutionResult status;
 };
 
-std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::uint32_t start = 0, ReadCursor read = {}, bool defer = false) {
-    std::uint32_t cursor = start;
+// Runs the buffer from state.cursor. With defer, an unsatisfied wait returns true and leaves state at
+// that wait, for the queue worker to resume.
+bool _execute(const Apr::CommandBufferObject& buffer, Deferred& state, bool defer = false) {
+    std::uint32_t& cursor = state.cursor;
+    ReadCursor& read = state.read;
     while (cursor < buffer.offset) {
         if (buffer.offset - cursor < Apr::NopHeaderBytes) throw std::runtime_error("APR: truncated command buffer");
         std::uint32_t first;
@@ -588,7 +797,7 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
             std::memcpy(&command, buffer.base + cursor, sizeof(command));
             const auto offset = static_cast<std::uint64_t>(command.opcodeAndOffsetHigh >> 8u) << 32u | command.offsetLow;
             if (offset >= 0x10000000000ull) throw std::runtime_error("APR: malformed compact gather offset");
-            _readResolved(Apr::Opcode::ReadFileGather, Apr::ReadFileCommand{{}, 0, 0, 0, static_cast<std::uint64_t>(command.sizeMinusOne) + 1u, offset}, read);
+            _readResolved(Apr::Opcode::ReadFileGather, Apr::ReadFileCommand{{}, 0, 0, 0, static_cast<std::uint64_t>(command.sizeMinusOne) + 1u, offset}, read, cursor, state.status);
             cursor += sizeof(command);
             continue;
         }
@@ -602,7 +811,7 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
         case Apr::Opcode::ReadFileGather:
         case Apr::Opcode::ReadFileScatter:
         case Apr::Opcode::ReadFileGatherScatter:
-            _readResolved(header.opcode, _read<Apr::ReadFileCommand>(buffer, cursor), read);
+            _readResolved(header.opcode, _read<Apr::ReadFileCommand>(buffer, cursor), read, cursor, state.status);
             break;
         case Apr::Opcode::ResetGatherScatterState:
             read = {};
@@ -650,12 +859,13 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
             const auto command = _read<Apr::WaitCommand>(buffer, cursor);
             const bool counter = header.opcode == Apr::Opcode::WaitOnCounter;
             const std::uint32_t unused = counter ? 64u - _counterField(command.access).bits : 0u;
+            if (!counter) static_cast<void>(_loadGuestAddress(command.address));
             const auto current = [&]() -> std::uint64_t {
                 if (counter) return _readCounter(command.counter, command.access);
                 return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).load(std::memory_order_acquire);
             };
             const std::uint64_t reference = (command.reference & command.mask) << unused;
-            if (defer && !_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) return Deferred{cursor, read};
+            if (defer && !_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) return true;
             while (!_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) PreciseSleepUs(50);
             break;
         }
@@ -667,7 +877,7 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
         }
         case Apr::Opcode::WriteAddressFromTimeCounter: {
             const auto command = _read<Apr::WriteAddressFromCounterCommand>(buffer, cursor);
-            std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).store(sceKernelGetProcessTimeCounter(), std::memory_order_release);
+            _storeGuestAddress(command.address, sceKernelGetProcessTimeCounter());
             break;
         }
         case Apr::Opcode::WriteAddressFromCounter:
@@ -675,7 +885,7 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
             const auto command = _read<Apr::WriteAddressFromCounterCommand>(buffer, cursor);
             std::uint64_t value = _counter(command.counter0);
             if (header.opcode == Apr::Opcode::WriteAddressFromCounterPair) value |= static_cast<std::uint64_t>(_counter(command.counter1)) << 32u;
-            std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).store(value, std::memory_order_release);
+            _storeGuestAddress(command.address, value);
             break;
         }
         default:
@@ -683,7 +893,15 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
         }
         cursor += header.bytes;
     }
-    return std::nullopt;
+    return false;
+}
+
+// Called when the whole buffer has run. sceKernelAprSubmitCommandBufferAndGetResult already wrote a
+// zero result at submission; a failed command replaces it before the submission counts as completed,
+// so a guest that waits on the id reads the final value.
+void _reportResult(const ExecutionResult& status, std::uint32_t* result) {
+    if (status.result == 0) return;
+    _storeResult(result, status);
 }
 
 }
@@ -714,21 +932,40 @@ struct AprQueue {
     std::mutex submit;
     std::mutex mutex;
     std::condition_variable ready;
-    std::condition_variable done;
     struct Work {
         std::vector<std::uint8_t> commands;
         Deferred resume;
         std::uint32_t id = 0;
+        std::uint32_t* result = nullptr;
     };
     std::deque<Work> pending;
     bool running = false;
-    std::uint32_t submitted = 0;
-    std::uint32_t completed = 0;
 };
 
-AprQueue* _startQueue() {
+struct AprCompletion {
+    std::mutex mutex;
+    std::condition_variable done;
+    std::set<std::uint32_t> outstanding;
+    std::uint32_t issued = 0;
+};
+
+AprCompletion& _completion(bool amm) {
+    static AprCompletion* const completions[2] = {new AprCompletion(), new AprCompletion()};
+    return *completions[amm ? 1 : 0];
+}
+
+void _complete(bool amm, std::uint32_t id) {
+    auto& completion = _completion(amm);
+    {
+        std::lock_guard lock(completion.mutex);
+        completion.outstanding.erase(id);
+    }
+    completion.done.notify_all();
+}
+
+AprQueue* _startQueue(bool amm) {
     auto* created = new AprQueue();
-    std::thread([created] {
+    std::thread([created, amm] {
         for (;;) {
             AprQueue::Work work;
             {
@@ -740,77 +977,96 @@ AprQueue* _startQueue() {
             }
             try {
                 const auto bytes = static_cast<std::uint32_t>(work.commands.size());
-                _execute(Apr::CommandBufferObject{Apr::BufferType::Generic, 0, bytes, 0, bytes, work.commands.data()}, work.resume.cursor, work.resume.read);
+                _execute(Apr::CommandBufferObject{Apr::BufferType::Generic, 0, bytes, 0, bytes, work.commands.data()}, work.resume);
             } catch (const std::exception& error) {
                 std::fprintf(stderr, "APR: %s\n", error.what());
                 std::fflush(stderr);
                 std::abort();
             }
+            _reportResult(work.resume.status, work.result);
             {
                 std::lock_guard lock(created->mutex);
                 created->running = false;
-                created->completed = std::max(created->completed, work.id);
             }
-            created->done.notify_all();
+            _complete(amm, work.id);
         }
     }).detach();
     return created;
 }
 
-AprQueue& _queue(bool amm) {
-    static AprQueue* const queues[2] = {_startQueue(), _startQueue()};
-    return *queues[amm ? 1 : 0];
+AprQueue& _queue(bool amm, std::uint32_t priority) {
+    if (amm) {
+        static AprQueue* const ammQueue = _startQueue(true);
+        return *ammQueue;
+    }
+    static std::mutex& queuesLock = *new std::mutex();
+    static std::map<std::uint32_t, AprQueue*>& queues = *new std::map<std::uint32_t, AprQueue*>();
+    std::lock_guard lock(queuesLock);
+    auto& queue = queues[priority];
+    if (queue == nullptr) queue = _startQueue(false);
+    return *queue;
 }
 
-std::uint32_t _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm) {
-    auto& queue = _queue(amm);
+std::optional<std::uint32_t> _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm, std::uint32_t priority = 0, std::uint32_t* guestId = nullptr, std::uint32_t* guestResult = nullptr) {
+    auto& queue = _queue(amm, priority);
+    auto& completion = _completion(amm);
     std::lock_guard submitLock(queue.submit);
     std::uint32_t id;
+    {
+        std::lock_guard lock(completion.mutex);
+        id = ++completion.issued;
+        completion.outstanding.insert(id);
+    }
+    const std::uint32_t succeeded = 0;
+    if ((guestId && !GuestCopyOut_nid_no_patch(guestId, &id, sizeof(id))) || (guestResult && !GuestCopyOut_nid_no_patch(guestResult, &succeeded, sizeof(succeeded)))) {
+        _complete(amm, id);
+        return std::nullopt;
+    }
     bool queued;
     {
         std::lock_guard lock(queue.mutex);
-        id = ++queue.submitted;
         queued = queue.running || !queue.pending.empty();
     }
-    const auto enqueue = [&](Deferred resume) {
+    const auto enqueue = [&](const Deferred& resume) {
         {
             std::lock_guard lock(queue.mutex);
-            queue.pending.push_back({std::vector<std::uint8_t>(base, base + bytes), resume, id});
+            queue.pending.push_back({std::vector<std::uint8_t>(base, base + bytes), resume, id, guestResult});
         }
         queue.ready.notify_one();
     };
     if (queued) {
-        enqueue({});
+        Deferred fresh;
+        fresh.status.sink = guestResult;
+        enqueue(fresh);
         return id;
     }
-    if (const auto deferred = _execute(Apr::CommandBufferObject{Apr::BufferType::Generic, 0, bytes, 0, bytes, const_cast<std::uint8_t*>(base)}, 0, {}, true)) {
-        enqueue(*deferred);
+    Deferred state;
+    state.status.sink = guestResult;
+    if (_execute(Apr::CommandBufferObject{Apr::BufferType::Generic, 0, bytes, 0, bytes, const_cast<std::uint8_t*>(base)}, state, true)) {
+        enqueue(state);
         return id;
     }
-    {
-        std::lock_guard lock(queue.mutex);
-        queue.completed = std::max(queue.completed, id);
-    }
-    queue.done.notify_all();
+    _reportResult(state.status, guestResult);
+    _complete(amm, id);
     return id;
 }
 
 void _waitSubmitted(std::uint32_t id, bool amm) {
-    auto& queue = _queue(amm);
-    std::unique_lock lock(queue.mutex);
-    queue.done.wait(lock, [&] { return queue.completed >= id || id > queue.submitted; });
+    auto& completion = _completion(amm);
+    std::unique_lock lock(completion.mutex);
+    completion.done.wait(lock, [&] { return id > completion.issued || !completion.outstanding.contains(id); });
 }
 
 std::uint32_t AmmSubmit_nid_no_patch(void* base, std::uint32_t bytes) {
-    return _submit(static_cast<const std::uint8_t*>(base), bytes, true);
+    return *_submit(static_cast<const std::uint8_t*>(base), bytes, true);
 }
 
 bool AmmSubmitted_nid_no_patch(std::uint32_t id) {
     if (id == 0) return false;
     {
-        auto& queue = _queue(true);
-        std::lock_guard lock(queue.mutex);
-        if (id > queue.submitted) return false;
+        auto& completion = _completion(true);
+        std::lock_guard lock(completion.mutex);
+        if (id > completion.issued) return false;
     }
     _waitSubmitted(id, true);
     return true;
@@ -831,10 +1087,16 @@ int APS5_VABI sceKernelAprResolveFilepathsToIds(const char** paths, uint32_t cou
 int APS5_VABI sceKernelAprResolveFilepathsToIdsAndFileSizes(const char** paths, uint32_t count, uint32_t* ids, uint64_t* sizes, uint32_t* error_index) {
     if (!paths || !ids || !sizes) return _fail(GUEST_EINVAL);
     for (uint32_t index = 0; index < count; ++index) {
-        if (!_resolve(paths[index], &ids[index], &sizes[index])) {
-            ids[index] = INVALID_FILE_ID;
-            if (sizes) sizes[index] = 0;
-            if (error_index) *error_index = index;
+        uint32_t id = INVALID_FILE_ID;
+        uint64_t size = 0;
+        const bool resolved = _resolve(paths[index], &id, &size);
+        if (!resolved) {
+            id = INVALID_FILE_ID;
+            size = 0;
+        }
+        if (!GuestCopyOut_nid_no_patch(&ids[index], &id, sizeof(id)) || !GuestCopyOut_nid_no_patch(&sizes[index], &size, sizeof(size))) return _fail(GUEST_EFAULT);
+        if (!resolved) {
+            if (error_index && !GuestCopyOut_nid_no_patch(error_index, &index, sizeof(index))) return _fail(GUEST_EFAULT);
             return _fail(GUEST_ENOENT);
         }
     }
@@ -845,10 +1107,16 @@ int APS5_VABI sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes(const char
     if (!prefix || !paths || !ids) return _fail(GUEST_EINVAL);
     for (uint32_t index = 0; index < count; ++index) {
         const std::string path = paths[index] ? std::string(prefix) + paths[index] : std::string();
-        if (path.empty() || !_resolve(path.c_str(), &ids[index], sizes ? &sizes[index] : nullptr)) {
-            ids[index] = INVALID_FILE_ID;
-            if (sizes) sizes[index] = 0;
-            if (error_index) *error_index = index;
+        uint32_t id = INVALID_FILE_ID;
+        uint64_t size = 0;
+        const bool resolved = !path.empty() && _resolve(path.c_str(), &id, sizes ? &size : nullptr);
+        if (!resolved) {
+            id = INVALID_FILE_ID;
+            size = 0;
+        }
+        if (!GuestCopyOut_nid_no_patch(&ids[index], &id, sizeof(id)) || (sizes && !GuestCopyOut_nid_no_patch(&sizes[index], &size, sizeof(size)))) return _fail(GUEST_EFAULT);
+        if (!resolved) {
+            if (error_index && !GuestCopyOut_nid_no_patch(error_index, &index, sizeof(index))) return _fail(GUEST_EFAULT);
             return _fail(GUEST_ENOENT);
         }
     }
@@ -861,37 +1129,65 @@ int APS5_VABI sceKernelAprResolveFilepathsWithPrefixToIds(const char* prefix, co
 
 int APS5_VABI sceKernelAprGetFileSize(uint32_t id, uint64_t* size) {
     if (!size) return _fail(GUEST_EINVAL);
-    *size = _file(id).size;
+    if (_badFileIdPolicy() != BadFileIdPolicy::Abort && !_knownFileId(id)) {
+        _reportUnknownFileId(id, "size query");
+        return _fail(GUEST_ENOENT);
+    }
+    const std::uint64_t bytes = _file(id).size;
+    if (!GuestCopyOut_nid_no_patch(size, &bytes, sizeof(bytes))) return _fail(GUEST_EFAULT);
     return 0;
 }
 
 int APS5_VABI sceKernelAprGetFileStat(uint32_t id, FileStat* stat) {
     if (!stat) return _fail(GUEST_EINVAL);
-    File::FillFileStat(_file(id).path, stat);
+    if (_badFileIdPolicy() != BadFileIdPolicy::Abort && !_knownFileId(id)) {
+        _reportUnknownFileId(id, "stat");
+        return _fail(GUEST_ENOENT);
+    }
+    FileStat result{};
+    File::FillFileStat(_file(id).path, &result);
+    if (!GuestCopyOut_nid_no_patch(stat, &result, sizeof(result))) return _fail(GUEST_EFAULT);
+    return 0;
+}
+
+std::optional<std::vector<std::uint8_t>> _guestCommands(const Apr::CommandBufferObject& object) {
+    if (object.offset > object.size) return std::nullopt;
+    std::vector<std::uint8_t> commands;
+    try {
+        commands.resize(object.offset);
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
+    if (object.offset != 0 && !GuestCopyIn_nid_no_patch(commands.data(), object.base, object.offset)) return std::nullopt;
+    return commands;
+}
+
+int _submitGuest(const Apr::CommandBufferObject* buffer, uint32_t priority, uint32_t* id, uint32_t* result) {
+    if (!buffer) return _fail(GUEST_EINVAL);
+    Apr::CommandBufferObject object{};
+    if (!GuestCopyIn_nid_no_patch(&object, buffer, sizeof(object))) return _fail(GUEST_EFAULT);
+    const auto commands = _guestCommands(object);
+    if (!commands) return _fail(GUEST_EFAULT);
+    if (!_submit(commands->data(), static_cast<std::uint32_t>(commands->size()), false, priority, id, result)) return _fail(GUEST_EFAULT);
     return 0;
 }
 
 int APS5_VABI sceKernelAprSubmitCommandBuffer(const Apr::CommandBufferObject* buffer, uint32_t priority) {
-    (void)priority;
-    if (!buffer) return _fail(GUEST_EINVAL);
-    _submit(buffer->base, buffer->offset, false);
-    return 0;
+    return _submitGuest(buffer, priority, nullptr, nullptr);
 }
 
 int APS5_VABI sceKernelAprSubmitCommandBufferAndGetId(const Apr::CommandBufferObject* buffer, uint32_t priority, uint32_t* id) {
     if (!id) return _fail(GUEST_EINVAL);
-    (void)priority;
-    if (!buffer) return _fail(GUEST_EINVAL);
-    *id = _submit(buffer->base, buffer->offset, false);
-    return 0;
+    return _submitGuest(buffer, priority, id, nullptr);
 }
 
+// result is the guest's {int32 result, uint32 errorOffset}. The zero result is written before the
+// buffer runs; a failed command (an unknown file id) then stores its error and offset when the
+// submission completes, before sceKernelAprWaitCommandBuffer on the id returns.
 int APS5_VABI sceKernelAprSubmitCommandBufferAndGetResult(const Apr::CommandBufferObject* buffer, uint32_t priority, uint32_t* result, uint32_t* id) {
     if (!result) return _fail(GUEST_EINVAL);
-    const int submitted = sceKernelAprSubmitCommandBufferAndGetId(buffer, priority, id);
-    if (submitted != 0) return submitted;
-    *result = 0;
-    return 0;
+    if (!id) return _fail(GUEST_EINVAL);
+    return _submitGuest(buffer, priority, id, result);
 }
 
 int APS5_VABI sceKernelAprWaitCommandBuffer(uint32_t id) {

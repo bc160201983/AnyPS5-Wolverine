@@ -405,8 +405,10 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
         now = Clock::now();
     }
     if (context->advancedMode && context->advancedGrains.empty()) {
-        if (!blocking) throw std::runtime_error("AudioOut2: a non-blocking push without a rendered grain is not implemented");
-        if (!context->grainReady.wait(lock, LibcShutdownToken_nid_postfix(), [&] { return !context->advancedGrains.empty(); })) throw ProcessShutdown{};
+        // A push with no grain from sceAudioOut2ContextAdvance: the PS5 only waits for queue room here.
+        // Waiting for an Advance deadlocks a title that pushes several grains to refill a drained
+        // queue from the thread that also advances (Wolverine's level load). Capture the grain now.
+        context->advancedGrains.push_back(AudioOut2CaptureGrain(*context, true));
         now = Clock::now();
         Drain(*context, now);
     }
@@ -443,6 +445,23 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
             }
             context->output.insert(context->output.end(), context->mix.begin(), context->mix.end());
         }
+    }
+    // A blocking push on the PS5 returns once the hardware has a free slot again, so the title's next
+    // queue-level check always finds room. Wwise (Wolverine) renders only while there is room and is
+    // woken by the push that follows; returning with the queue still reported full left its mixer and
+    // output threads waiting on each other for good at the first level load.
+    if (blocking && context->device != 0) {
+        const auto fullSince = Clock::now();
+        const auto titleLevel = [&] {
+            return std::min(context->queueDepth, QueueLevel(*context, Clock::now()) + static_cast<std::uint32_t>(context->advancedGrains.size()));
+        };
+        while (titleLevel() >= context->queueDepth && Clock::now() - fullSince < FULL_WAIT_TIMEOUT) {
+            PublishQueueLevel(*context);
+            lock.unlock();
+            PreciseSleepUs(std::chrono::microseconds(FULL_WAIT_STEP).count());
+            lock.lock();
+        }
+        now = Clock::now();
     }
     context->pushes++;
     context->summaryPushes++;

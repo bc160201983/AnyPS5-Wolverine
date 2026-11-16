@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "prx/libSceSystemService/include/SystemService.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -198,7 +200,19 @@ int APS5_VABI sceUserServiceGetGamePresets(int user_id, UserServiceGamePresets* 
   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
  }
  presets->difficulty = 0;
- presets->priority = 0;
+ // APS5_GAME_PRESET_PRIORITY=<n> (default 0, "not specified"): the system preset\'s performance /
+ // resolution priority, which a title may read to pick its default graphics mode.
+ static const unsigned preset_priority = [] {
+  const char* value = std::getenv("APS5_GAME_PRESET_PRIORITY");
+  return value != nullptr ? static_cast<unsigned>(std::strtoul(value, nullptr, 10)) : 0u;
+ }();
+ static bool logged = false;
+ if (!logged) {
+  logged = true;
+  std::fprintf(stderr, "[userservice] game read the Game Presets (priority %u)\n", preset_priority);
+  std::fflush(stderr);
+ }
+ presets->priority = preset_priority;
  presets->invert_vertical_view_for_1st_person_view = 0;
  presets->invert_horizontal_view_for_1st_person_view = 0;
  presets->invert_vertical_view_for_3rd_person_view = 0;

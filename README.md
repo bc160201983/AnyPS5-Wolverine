@@ -1,47 +1,107 @@
-**English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md)
+# AnyPS5 for Marvel's Wolverine on PC
 
-# About
+This is [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5) with 29 patches used to run **Marvel's Wolverine (PS5, PPSA03671, version 1.05)** on Windows.
 
-Tool for automatic executables porting to Linux and Windows.
+**What AnyPS5 does here:**
+- Its **relinker** converts the game's `eboot.bin` into a native Windows `Wolverine.exe`.
+- Its **system libraries** (`libs\*.prx`) stand in for the PS5's own.
+- `libAstroHybridHost.prx` (used as `astrohybrid_host.dll`) connects the game to the Kyty GPU engine.
 
-The relinker-only build runs on macOS, including Apple silicon.
+**Graphics** are not drawn by AnyPS5's own renderer. They go through Kyty (`kyty_gpu.dll`) from [Wolverine-PC-Kyty](https://github.com/bc160201983/Wolverine-PC-Kyty).
 
-[**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+**No game files are included.** You need your own dump of the game.
 
-![anyps5_collage1](https://github.com/user-attachments/assets/ed2f0b2d-33d3-46d7-ab88-767ca872fc99)
+The original AnyPS5 README is in [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md).
 
-Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
+## The three parts
 
-[**Discord**](https://discord.gg/BHFztBPUe), [Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
+| Repo | Makes |
+|---|---|
+| **AnyPS5-Wolverine** (this one) | `relinker.exe`, `Wolverine.exe` (from your eboot), `libs\*.prx`, `astrohybrid_host.dll` |
+| [Wolverine-PC-Kyty](https://github.com/bc160201983/Wolverine-PC-Kyty) | `kyty_gpu.dll`: PS5 graphics (Agc) to Vulkan; this is where the fps, crash and stutter work lives |
+| Wolverine-PC (coming) | Build scripts, run-folder setup and launcher settings that put the parts together |
 
-## Status
+The guest-to-Kyty forwarders (`libSceAgc`, `libSceAgcDriver`, `libSceVideoOut` in `libs\`) are generated from `src/hybrid/kytyGpuNids.inc` in the Kyty repo.
 
-[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![shaders](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
+## What the patches change
 
-[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
+These are on top of AnyPS5 `319621ba2e`. The Kyty bridge is active when the game runs with `APS5_GPU_ENGINE=kyty`. Many of the speed-ups are behind the named `APS5_*` switches.
 
-[Progress history](https://boykopovar.github.io/AnyPS5/history.html)
+**Kyty bridge (Wolverine runs on these):**
+- `libkernel`: hands guest memory to Kyty's GPU stack (`APS5_GPU_ENGINE=kyty`).
+- `libAstroHybridHost`:
+  - publishes Kyty's window input to `libScePad`;
+  - takes pad motion sensors from Kyty;
+  - ends the process cleanly when Kyty's window closes.
+- `libScePad`: DualSense trigger-effect state from the game, with pad output sent to Kyty.
+- `libAudioOut` / `libSaveData`:
+  - wireless DualSense audio forwarded to Kyty;
+  - `sceSaveDataTransferringMount` exported.
+- `libc`: optionally keeps a CUDA address window free in the guest arena.
+- Wolverine fixes:
+  - an AudioOut2 deadlock;
+  - APR/AMPR file-reader fixes;
+  - thread dumps in crash reports;
+  - Game Presets priority (`APS5_GAME_PRESET_PRIORITY`).
 
-<sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
+**Speed-ups in AnyPS5's own Agc renderer and libc** (useful for other games; Wolverine draws through Kyty):
+- draw snapshots in resizable-BAR memory;
+- GPU-produced buffers bound in place and read from device-local shadows;
+- DMA_DATA/GDS stores recorded on the GPU instead of draining;
+- write alarms on resident guest pages instead of `GetWriteWatch` polling;
+- compute lanes on a second Vulkan queue (`APS5_COMPUTE_LANE`, `APS5_COMPUTE_QUEUE`);
+- completion-label-only syncs (`APS5_SYNC_COMPLETION_LABELS_ONLY`);
+- a texture-cache budget floor (`APS5_SAMPLED_BUDGET_FLOOR_MIB`);
+- pool shedding over the VRAM budget;
+- rebased draw-stage reuse;
+- recompiler memo fast path;
+- `APS5_TRACE_MARKERS` (pass names with draw/dispatch counts per frame).
 
-Unsupported or unexpected states strictly throw `std::runtime_error`. `what()` is printed to stderr and the process terminates.
+The full list is in `git log 319621ba2e..main`.
 
-The [shader recompiler](core/shader/recompiler/Recompiler.cpp) successfully produces SPIR-V (validated via [Spirv-Tools](3rdparty/SPIRV-Tools) when built with `ANYPS5_ENABLE_SPIRV_TOOLS`).
+## Build (Windows)
 
-## Compatibility
+What you need:
+- **WinLibs GCC 15.2.0 posix-seh UCRT r7**, from [this exact zip](https://github.com/brechtsanders/winlibs_mingw/releases/download/15.2.0posix-14.0.0-ucrt-r7/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip). Its SHA-256 is `CB2FBAD6162540CDF5E1FACDCE08D4DAC359E8CF64F7F696A99274291763B815`.
+- Python 3 and Git.
 
-Per-game status and test reports live in the [Game bring-up](https://github.com/boykopovar/AnyPS5/discussions/categories/game-bring-up) discussions, one thread per title.
+Put the WinLibs `mingw64\bin` folder first on PATH **in this shell only**; its bundled CMake and Ninja are the ones used. If the FFmpeg download fails with a TLS error, set `SSL_CERT_FILE` to a CA bundle. Then build:
 
-## Input mapping
+```
+git clone https://github.com/bc160201983/AnyPS5-Wolverine.git
+cd AnyPS5-Wolverine
+git submodule update --init --recursive --depth 1
+cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DPython3_EXECUTABLE=<path to python.exe>
+cmake --build _build --parallel
+cmake --build _build --target libs --parallel
+```
 
-SDL-mapped game controllers are supported, including analog sticks and triggers. Keyboard and mouse controls can be configured with an `anyps5-input.ini` file. See [input mapping](docs/user/INPUT_MAPPING.md) for the supported devices and configuration format.
+Outputs:
+- `_build\core\relinker\relinker.exe`
+- `_build\core\libs\libs\*.prx`, including `libAstroHybridHost.prx`
 
-## Disclaimer
+## Make Wolverine.exe
 
-This project is intended for interoperability, research, preservation, and compatibility purposes. It does not include, distribute, or require copyrighted software, firmware, cryptographic keys, or proprietary libraries. Users are responsible for ensuring that any binaries used with this project are obtained and used in accordance with applicable laws and their respective license terms.
+Do this in a **copy** of your dump's folder (the relinker writes `*.guest.prx` modules next to the game files):
 
-AnyPS5 is an independent project and is not affiliated with, authorized or endorsed by Sony Interactive Entertainment. "PlayStation" and "PS5" are trademarks of Sony Interactive Entertainment Inc.
+```
+relinker --windows --registry --module-dir . eboot.bin <RunFolder>\Wolverine.exe
+```
 
-## License
+Then assemble the run folder:
 
-This project is licensed under the GNU General Public License version 2 only.
+| Copy | To |
+|---|---|
+| `libs\*.prx` | `<RunFolder>\libs\` |
+| `libAstroHybridHost.prx` | `<RunFolder>\astrohybrid_host.dll` |
+| `kyty_gpu.dll` from Wolverine-PC-Kyty | `<RunFolder>\` |
+| your `app0` | `<RunFolder>\app0\` |
+
+Start it with the launcher settings in the Wolverine-PC-Kyty README.
+
+## Credits and license
+
+- AnyPS5 by boykopovar and contributors.
+- Patches by faycal and BC160201983.
+
+GPL-2.0, see [LICENSE](LICENSE). This is an unofficial fan project, not affiliated with Insomniac Games, Sony or Marvel.
